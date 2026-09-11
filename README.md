@@ -204,3 +204,6 @@ Yes: env vars (`GITMANCER_AI_KEY`, `GITMANCER_GITHUB_TOKEN`) + `--yolo` + `--jso
 
 **What do contributions to the graph require?**
 Commits count when the author email is linked to the GitHub account, the repo is not a fork, and the commit lands on the default branch. The linked noreply format `<id>+<login>@users.noreply.github.com` always works.
+
+**How do I speed up long agent runs?**
+Use `--fast` for simple tasks, keep tasks scoped (`--cwd` to the project), rely on the workspace snapshot instead of asking the agent to explore, raise `--steps` only when a task genuinely needs it, and set `aiFallbacks` so a rate-limited provider doesn't stall the loop.
