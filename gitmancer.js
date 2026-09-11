@@ -392,9 +392,31 @@ function safePath(cwd, p) {
 
 const IGNORE_DIRS = new Set(["node_modules", ".git", "dist", "build", "out", "__pycache__", ".next", "venv", ".venv", ".cache"]);
 
+function loadIgnorePatterns(cwd) {
+  const pats = new Set(IGNORE_DIRS);
+  try {
+    const gi = fs.readFileSync(path.join(cwd, ".gitignore"), "utf8");
+    for (let line of gi.split("\n")) {
+      line = line.trim();
+      if (!line || line.startsWith("#")) continue;
+      pats.add(line.replace(/^\//, "").replace(/\/$/, ""));
+    }
+  } catch {}
+  return pats;
+}
+
 function toolListFiles(cwd, rel) {
   const root = safePath(cwd, rel || ".");
   const out = [];
+  const ignored = loadIgnorePatterns(cwd);
+  const isIgnored = (name) => {
+    if (ignored.has(name)) return true;
+    for (const p of ignored) {
+      if (p.endsWith("*") && name.startsWith(p.slice(0, -1))) return true; // build*
+      if (p.startsWith("*.") && name.endsWith(p.slice(1))) return true; // *.log
+    }
+    return false;
+  };
   const walk = (dir, depth) => {
     if (depth > 4 || out.length > 400) return;
     let entries;
@@ -411,7 +433,7 @@ function toolListFiles(cwd, rel) {
         return;
       }
       if (e.name.startsWith(".") && e.name !== ".github" && e.name !== ".env.example") continue;
-      if (IGNORE_DIRS.has(e.name)) continue;
+      if (isIgnored(e.name)) continue;
       const rel2 = path.join(path.relative(cwd, dir), e.name);
       if (e.isDirectory()) {
         out.push(rel2 + "/");
