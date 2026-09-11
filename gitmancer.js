@@ -111,11 +111,13 @@ function loadConfig() {
     warn(`could not parse ${CONFIG_FILE} (${e.message}) — using env/defaults`);
   }
   return {
+    preset: fileCfg.preset || "groq",
     aiBase: process.env.GITMANCER_AI_BASE || fileCfg.aiBase || PRESETS.groq.base,
     aiModel: process.env.GITMANCER_AI_MODEL || fileCfg.aiModel || PRESETS.groq.model,
     aiKey: process.env.GITMANCER_AI_KEY || fileCfg.aiKey || "",
     githubToken: process.env.GITMANCER_GITHUB_TOKEN || fileCfg.githubToken || "",
     ghBase: process.env.GITMANCER_GH_BASE || fileCfg.ghBase || GH_API_DEFAULT,
+    aiFallbacks: Array.isArray(fileCfg.aiFallbacks) ? fileCfg.aiFallbacks : [],
   };
 }
 
@@ -263,6 +265,26 @@ function sseAccumulator(onDelta) {
 }
 
 async function aiChat(cfg, messages, tools, opts = {}) {
+  const chain = [{ aiBase: cfg.aiBase, aiModel: cfg.aiModel, aiKey: cfg.aiKey }];
+  for (const fb of cfg.aiFallbacks || []) {
+    if (fb && fb.base && fb.model) chain.push({ aiBase: fb.base, aiModel: fb.model, aiKey: fb.key || cfg.aiKey });
+  }
+  let lastErr;
+  for (let i = 0; i < chain.length; i++) {
+    const c = chain[i];
+    try {
+      const r = await aiChatProvider({ ...cfg, aiBase: c.aiBase, aiModel: c.aiModel, aiKey: c.aiKey }, messages, tools, opts);
+      if (i > 0) console.error(dim(`  ↪ served by fallback #${i} (${c.aiModel})`));
+      return r;
+    } catch (e) {
+      lastErr = e;
+      if (i + 1 < chain.length) console.error(yellow(`  ↪ ${String(e.message).slice(0, 160)} — trying fallback (${chain[i + 1].aiModel})`));
+    }
+  }
+  throw lastErr;
+}
+
+async function aiChatProvider(cfg, messages, tools, opts = {}) {
   const isLocal = /localhost|127\.0\.0\.1/.test(cfg.aiBase);
   if (!cfg.aiKey && !isLocal) {
     throw new UserErr("No AI key. Run `gitmancer setup` or export GITMANCER_AI_KEY.");
