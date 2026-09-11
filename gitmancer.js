@@ -945,11 +945,20 @@ async function cmdIssue(pos, flags) {
   const cfg = loadConfig();
   const repo = pos[0];
   const action = (pos[1] || "list").toLowerCase();
-  if (!repo || !repo.includes("/")) throw new UserErr('usage: gitmancer issue <owner/repo> list | create "Title" [--body "..."] | close <number>');
+  if (!repo || !repo.includes("/")) throw new UserErr('usage: gitmancer issue <owner/repo> list | create "Title" [--body "..."] | close <number> | reopen <number>');
   banner();
   if (action === "list") {
     const items = await gh(cfg, "GET", `/repos/${repo}/issues?state=${flags.state || "open"}&per_page=${flags.limit || 20}`);
     const issues = (items || []).filter((i) => !i.pull_request);
+    if (flags.json) {
+      return console.log(
+        JSON.stringify(
+          issues.map((i) => ({ number: i.number, title: i.title, user: i.user && i.user.login, labels: (i.labels || []).map((l) => l.name), url: i.html_url })),
+          null,
+          2
+        )
+      );
+    }
     if (!issues.length) return ok(`no ${flags.state || "open"} issues on ${repo}`);
     for (const i of issues) {
       const labels = (i.labels || []).map((l) => l.name).join(",");
@@ -966,8 +975,13 @@ async function cmdIssue(pos, flags) {
     if (!n) throw new UserErr("usage: gitmancer issue owner/repo close 12");
     await gh(cfg, "PATCH", `/repos/${repo}/issues/${n}`, { state: "closed" });
     ok(`closed #${n}`);
+  } else if (action === "reopen") {
+    const n = parseInt(pos[2], 10);
+    if (!n) throw new UserErr("usage: gitmancer issue owner/repo reopen 12");
+    await gh(cfg, "PATCH", `/repos/${repo}/issues/${n}`, { state: "open" });
+    ok(`reopened #${n}`);
   } else {
-    throw new UserErr(`unknown action "${action}" — try list | create | close`);
+    throw new UserErr(`unknown action "${action}" — try list | create | close | reopen`);
   }
 }
 
@@ -1342,7 +1356,8 @@ ${bold("COMMANDS")}
   ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
   ${cyan("newrepo")} <name>         create GitHub repo + optionally push a folder in one shot
                     ${dim("--private  --source <dir>  --desc \"…\"  --m \"initial commit msg\"")}
-  ${cyan("issue")} <owner/repo> …   list | create "Title" [--body "…"] | close <number>
+  ${cyan("issue")} <owner/repo> …   list | create "Title" [--body "…"] | close <number> | reopen <number>
+                    ${dim('--state all|open|closed  --limit N  --json')}
   ${cyan("pr")}                    open a pull request — AI drafts title & body from your commits
                     ${dim('--base main  --head <branch>  --repo owner/name  --title "…"  --body "…"  --yolo')}
   ${cyan("pr list")}                list pull requests                ${dim('--state all|open|closed|merged  --repo owner/name  --json')}
