@@ -199,6 +199,18 @@ async function gh(cfg, method, endpoint, body, opts = {}) {
   return data;
 }
 
+async function ghPaginate(cfg, endpoint, limit = 200) {
+  const out = [];
+  const sep = endpoint.includes("?") ? "&" : "?";
+  for (let page = 1; out.length < limit; page++) {
+    const chunk = await gh(cfg, "GET", `${endpoint}${sep}per_page=100&page=${page}`);
+    if (!Array.isArray(chunk) || !chunk.length) break;
+    out.push(...chunk);
+    if (chunk.length < 100) break;
+  }
+  return out.slice(0, limit);
+}
+
 /* ---------------- AI client (OpenAI-compatible, SSE streaming + retry + fallback) ---------------- */
 
 const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
@@ -779,12 +791,15 @@ async function cmdWhoami() {
 async function cmdRepos(flags) {
   const cfg = loadConfig();
   const limit = parseInt(flags.limit, 10) || 50;
-  const all = [];
-  for (let page = 1; all.length < limit; page++) {
-    const chunk = await gh(cfg, "GET", `/user/repos?per_page=100&page=${page}&sort=updated`);
-    if (!chunk || !chunk.length) break;
-    all.push(...chunk);
-    if (chunk.length < 100) break;
+  const all = await ghPaginate(cfg, "/user/repos?sort=updated", limit);
+  if (flags.json) {
+    return console.log(
+      JSON.stringify(
+        all.slice(0, limit).map((r) => ({ name: r.full_name, private: !!r.private, language: r.language, stars: r.stargazers_count, pushed: (r.pushed_at || "").slice(0, 10), url: r.html_url })),
+        null,
+        2
+      )
+    );
   }
   if (!all.length) return ok("no repositories found");
   console.log(`\n${bold(all.length + " repos (most recently updated):")}\n`);
@@ -1317,7 +1332,7 @@ async function cmdSweep(pos, flags) {
     console.log(dim("listing your repositories…"));
   }
   const limit = parseInt(flags.limit, 10) || 30;
-  const repos = await gh(cfg, "GET", `/user/repos?per_page=100&sort=pushed`);
+  const repos = await ghPaginate(cfg, "/user/repos?sort=pushed", limit);
   const mine = (repos || []).slice(0, limit);
   if (!mine.length) return ok("no repositories found");
   const results = [];
@@ -1412,7 +1427,7 @@ ${bold("COMMANDS")}
                     ${dim("--preset groq|openai|openrouter|zai|ollama|custom  --key  --token  --model  --base")}
   ${cyan("config")}                 show current config (secrets masked)
   ${cyan("whoami")}                 verify GitHub token — who are you on GitHub?
-  ${cyan("repos")}                  list your repositories           ${dim("--limit 50")}
+  ${cyan("repos")}                  list your repositories           ${dim('--limit 50  --json')}
   ${cyan('ask')} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
                     ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>')}
   ${cyan('fix')} "<cmd>"            run a command; if it fails, the agent auto-fixes the code & re-verifies
