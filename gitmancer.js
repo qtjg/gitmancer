@@ -584,10 +584,41 @@ function systemPrompt(ctx) {
   return lines.join("\n");
 }
 
-function trimHistory(messages) {
-  if (messages.length <= 80) return;
-  const keep = 60;
-  messages.splice(1, messages.length - 1 - keep);
+function trimHistory(messages, max = 80, keep = 40) {
+  if (messages.length <= max) return;
+  // Compaction v2: never break a tool_call↔tool pair. Only cut at safe
+  // boundaries: keep system (index 0), keep the first real user task, then
+  // drop the oldest middle block ending right before a user message.
+  const firstUser = messages.findIndex((m, i) => i > 0 && m.role === "user");
+  const headEnd = firstUser > 0 ? firstUser : 1;
+  // find the last user message index whose suffix (from it to end) fits in `keep`
+  let cut = -1;
+  for (let i = messages.length - keep; i > headEnd; i--) {
+    if (messages[i] && messages[i].role === "user") {
+      cut = i;
+      break;
+    }
+  }
+  if (cut === -1) {
+    // fallback: plain tail keep from the first safe user boundary
+    for (let i = messages.length - 1; i > headEnd; i--) {
+      if (messages[i] && messages[i].role === "user") {
+        cut = i;
+        break;
+      }
+    }
+    if (cut === -1) return;
+  }
+  const dropped = cut - headEnd;
+  if (dropped <= 0) return;
+  const head = messages.slice(0, headEnd);
+  const tail = messages.slice(cut);
+  const stub = {
+    role: "user",
+    content: `[context compacted — ${dropped} earlier messages summarized away; the current task continues below]`,
+  };
+  messages.length = 0;
+  messages.push(...head, stub, ...tail);
 }
 
 function applyFast(cfg, flags) {
