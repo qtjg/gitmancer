@@ -33,14 +33,14 @@ keys you already have.
 **Option A — single file (no install):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USER/gitmancer/main/gitmancer.js -o gitmancer.js
+curl -fsSL https://raw.githubusercontent.com/qtjg/gitmancer/main/gitmancer.js -o gitmancer.js
 node gitmancer.js --help
 ```
 
 **Option B — npm global:**
 
 ```bash
-git clone https://github.com/YOUR_USER/gitmancer.git && cd gitmancer
+git clone https://github.com/qtjg/gitmancer.git && cd gitmancer
 npm install -g .
 gitmancer --help
 ```
