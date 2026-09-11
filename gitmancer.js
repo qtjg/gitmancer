@@ -1077,6 +1077,41 @@ async function cmdPr(pos, flags) {
   console.log("");
 }
 
+/* ---------------- review: AI code review of a pull request ---------------- */
+
+async function cmdReview(pos, flags) {
+  const cfg = applyFast(loadConfig(), flags);
+  const root = gitRoot(process.cwd());
+  const repo = (typeof flags.repo === "string" && flags.repo) || (root ? parseOriginRepo(root) : null);
+  const num = parseInt(pos[0], 10);
+  if (!repo || !repo.includes("/")) throw new UserErr("usage: gitmancer review <pr-number> [--repo owner/name]  (run inside the repo or pass --repo)");
+  if (!num) throw new UserErr("usage: gitmancer review <pr-number> — e.g. gitmancer review 12");
+  banner();
+  console.log(dim(`fetching PR #${num} on ${repo}…`));
+  const pr = await gh(cfg, "GET", `/repos/${repo}/pulls/${num}`);
+  const diffUrl = pr.diff_url || `${cfg.ghBase}/repos/${repo}/pulls/${num}`;
+  const diff = await gh(cfg, "GET", diffUrl, undefined, { cache: false }); // raw text (Accept overrides via diff_url)
+  const diffText = typeof diff === "string" ? diff : JSON.stringify(diff, null, 2);
+  console.log(dim(`PR: ${pr.title} (+${pr.additions ?? "?"}/-${pr.deletions ?? "?"} · ${pr.changed_files ?? "?"} files) — reviewing…\n`));
+  const { message } = await aiChat(cfg, [
+    {
+      role: "system",
+      content:
+        "You are a rigorous code reviewer. Review the PR diff. Output markdown:\n" +
+        "1. **Verdict** — APPROVE / REQUEST CHANGES / COMMENT (one line)\n" +
+        "2. **Findings** — bulleted, each prefixed [blocking], [major], [minor] or [nit], with file:line where possible\n" +
+        "3. **Missing tests/risks** — 1-3 bullets max.\n" +
+        "Be concrete. No praise padding. Max ~250 words.",
+    },
+    {
+      role: "user",
+      content: `PR #${num}: ${pr.title}\nBranch: ${pr.head && pr.head.ref} → ${pr.base && pr.base.ref}\n\nDiff:\n${capOut(diffText, 40000)}`,
+    },
+  ], null, { stream: true, onDelta: (t) => process.stdout.write(t) });
+  if (!message || !message.content) throw new UserErr("review returned empty — check your AI key/model");
+  console.log("\n");
+}
+
 /* ---------------- status: one-shot repo dashboard ---------------- */
 
 async function cmdStatus(pos, flags) {
@@ -1159,6 +1194,8 @@ ${bold("COMMANDS")}
                     ${dim('--base main  --head <branch>  --repo owner/name  --title "…"  --body "…"  --yolo')}
   ${cyan("status")}                 dashboard: branch, dirty files, ahead/behind, open issues/PRs, last CI run
                     ${dim('--repo owner/name  --json')}
+  ${cyan("review")} <pr#>           AI code review of a pull request — severity-tagged findings + verdict
+                    ${dim('--repo owner/name  --fast')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -1235,6 +1272,7 @@ async function main() {
     case "fix": return cmdFix(pos, flags);
     case "pr": return cmdPr(pos, flags);
     case "status": return cmdStatus(pos, flags);
+    case "review": return cmdReview(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
