@@ -880,6 +880,11 @@ async function cmdShip(pos, flags) {
   console.log(`commit: ${bold(msg)}`);
   gitOut(["commit", "-m", msg], root);
   const branch = gitOut(["rev-parse", "--abbrev-ref", "HEAD"], root);
+  if (flags["no-push"]) {
+    ok(`committed to ${cyan(branch)} — not pushing (--no-push)`);
+    console.log("");
+    return;
+  }
   try {
     gitOut(["push", "-u", "origin", branch], root);
     ok(`pushed ${cyan(branch)} → origin`);
@@ -1354,6 +1359,7 @@ ${bold("COMMANDS")}
   ${cyan('fix')} "<cmd>"            run a command; if it fails, the agent auto-fixes the code & re-verifies
                     ${dim('--yolo  --fast  --cwd <dir>')}
   ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
+                    ${dim('--no-push (commit locally only)')}
   ${cyan("newrepo")} <name>         create GitHub repo + optionally push a folder in one shot
                     ${dim("--private  --source <dir>  --desc \"…\"  --m \"initial commit msg\"")}
   ${cyan("issue")} <owner/repo> …   list | create "Title" [--body "…"] | close <number> | reopen <number>
@@ -1391,7 +1397,7 @@ ${bold("EXAMPLES")}
 `);
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase"]);
 
 function parseArgs(argv) {
   let cmd = null;
