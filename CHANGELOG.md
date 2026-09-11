@@ -6,6 +6,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 ## [Unreleased]
 
 ### Added
+- `pr list | close | merge` — full PR lifecycle from the terminal: list with
+  `--state all|open|closed|merged` (+ `--json`), confirm-gated close, and
+  merge with `--merge|--squash|--rebase` and optional `--subject`.
+- `issue reopen <n>` and `issue list --json`.
+- `ship --no-push` — commit locally without pushing (batch your pushes).
+- `--steps N` — raise (up to 100) or lower the agent loop step cap per run.
+- `newrepo --template node-lib` — scaffold package.json / index.js /
+  test/run.js / .gitignore into `--source` before the initial push.
+- `repos --json`, `whoami --json` — scripted account queries.
+- `ghPaginate` — Link-header-aware pagination helper; `repos` and `sweep`
+  now handle >100 repos correctly.
+- `list_files` (agent tool) now respects `.gitignore` patterns (basenames,
+  directories, `*.ext` globs, prefix globs) → cleaner prompts, fewer tokens.
+
+### Added
 - `review <pr#>` — AI code review of pull requests with severity-tagged findings
   (`[blocking]` / `[major]` / `[minor]` / `[nit]`) and an APPROVE / REQUEST
   CHANGES / COMMENT verdict. Streams as it reviews.
