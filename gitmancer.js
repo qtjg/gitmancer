@@ -1047,8 +1047,10 @@ async function aiPrDraft(cfg, root, base) {
 
 async function cmdPr(pos, flags) {
   const cfg = applyFast(loadConfig(), flags);
-  if (cfg.__fast) console.log(dim(`fast mode → ${cfg.aiModel}`));
   const root = gitRoot(process.cwd());
+  const repoArg = pos[0];
+  const action = repoArg === "list" || repoArg === "close" || repoArg === "merge" ? repoArg : null;
+  if (action) return cmdPrAction(action, pos.slice(1), flags, cfg);
   if (!root && !flags.repo) throw new UserErr("Not inside a git repo — pass --repo owner/name (and --head), or cd into your project.");
   const base = typeof flags.base === "string" ? flags.base : "main";
   const repo = (typeof flags.repo === "string" && flags.repo) || parseOriginRepo(root);
@@ -1074,6 +1076,64 @@ async function cmdPr(pos, flags) {
   if (!(await allow(`open PR ${head} → ${base} on ${repo}`, ctx))) return warn("aborted — no PR created");
   const pr = await gh(cfg, "POST", `/repos/${repo}/pulls`, { title: draft.title, head, base, body: draft.body || "" });
   ok(`PR #${pr.number} opened → ${pr.html_url}`);
+  console.log("");
+}
+
+/* ---------------- pr list / close / merge ---------------- */
+
+function cmdPrAction(action, pos, flags, cfg) {
+  if (action === "list") return cmdPrList(pos, flags, cfg);
+  if (action === "close") return cmdPrClose(pos, flags, cfg);
+  return cmdPrMerge(pos, flags, cfg);
+}
+
+async function prRepo(pos, flags, cfg) {
+  const root = gitRoot(process.cwd());
+  const posRepo = pos[0] && pos[0].includes("/") ? pos[0] : null;
+  const repo = (typeof flags.repo === "string" && flags.repo) || posRepo || (root ? parseOriginRepo(root) : null);
+  if (!repo || !repo.includes("/")) throw new UserErr("cannot determine the repo — pass --repo owner/name or run inside the repo");
+  return repo;
+}
+
+async function cmdPrList(pos, flags, cfg) {
+  const repo = await prRepo(pos, flags, cfg);
+  const state = flags.state || "open";
+  const items = await gh(cfg, "GET", `/repos/${repo}/pulls?state=${state}&per_page=${flags.limit || 20}`);
+  const prs = items || [];
+  if (flags.json) return console.log(JSON.stringify(prs.map((p) => ({ number: p.number, title: p.title, user: p.user && p.user.login, branch: p.head && p.head.ref, draft: !!p.draft, url: p.html_url })), null, 2));
+  if (!prs.length) return ok(`no ${state} pull requests on ${repo}`);
+  console.log(`\n${bold("Pull requests")} ${dim(state + " · " + repo)}\n`);
+  for (const p of prs) {
+    const branch = p.head && p.head.ref ? dim(p.head.ref) : "";
+    const draft = p.draft ? yellow("[draft]") : "";
+    console.log(`  ${cyan("#" + p.number)} ${bold(p.title)} ${draft} ${branch} ${dim(p.user && p.user.login || "")}`);
+  }
+  console.log("");
+}
+
+async function cmdPrClose(pos, flags, cfg) {
+  const repo = await prRepo(pos, flags, cfg);
+  const num = parseInt(pos[0], 10);
+  if (!num) throw new UserErr("usage: gitmancer pr close <number> [--repo owner/name]");
+  const ctx = { cwd: process.cwd(), yolo: !!flags.yolo, always: { value: false }, cfg };
+  if (!(await allow(`close PR #${num} on ${repo}`, ctx))) return warn("aborted — PR left open");
+  const p = await gh(cfg, "PATCH", `/repos/${repo}/pulls/${num}`, { state: "closed" });
+  ok(`closed PR #${p.number} → ${p.html_url}`);
+  console.log("");
+}
+
+async function cmdPrMerge(pos, flags, cfg) {
+  const repo = await prRepo(pos, flags, cfg);
+  const num = parseInt(pos[0], 10);
+  if (!num) throw new UserErr("usage: gitmancer pr merge <number> [--merge|--squash|--rebase] [--repo owner/name]");
+  const method = flags.squash ? "squash" : flags.rebase ? "rebase" : "merge";
+  const body = { merge_method: method };
+  if (typeof flags.subject === "string") body.commit_title = flags.subject;
+  const ctx = { cwd: process.cwd(), yolo: !!flags.yolo, always: { value: false }, cfg };
+  if (!(await allow(`merge PR #${num} on ${repo} (${method})`, ctx))) return warn("aborted — PR left open");
+  const r = await gh(cfg, "PUT", `/repos/${repo}/pulls/${num}/merge`, body);
+  if (r && r.merged) ok(`merged #${num} as ${cyan(r.sha.slice(0, 7))} (${r.merge_method || method})`);
+  else warn(`not merged: ${r && r.message ? r.message : "unexpected response"}`);
   console.log("");
 }
 
@@ -1285,6 +1345,9 @@ ${bold("COMMANDS")}
   ${cyan("issue")} <owner/repo> …   list | create "Title" [--body "…"] | close <number>
   ${cyan("pr")}                    open a pull request — AI drafts title & body from your commits
                     ${dim('--base main  --head <branch>  --repo owner/name  --title "…"  --body "…"  --yolo')}
+  ${cyan("pr list")}                list pull requests                ${dim('--state all|open|closed|merged  --repo owner/name  --json')}
+  ${cyan("pr close")} <n>           close a pull request              ${dim('--repo owner/name  --yolo')}
+  ${cyan("pr merge")} <n>           merge a PR — confirm-gated        ${dim('--squash  --rebase  --subject "…"  --repo owner/name')}
   ${cyan("status")}                 dashboard: branch, dirty files, ahead/behind, open issues/PRs, last CI run
                     ${dim('--repo owner/name  --json')}
   ${cyan("review")} <pr#>           AI code review of a pull request — severity-tagged findings + verdict
