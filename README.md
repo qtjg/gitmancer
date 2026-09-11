@@ -184,3 +184,26 @@ PRs welcome — keep it zero-dependency and single-file, that's the whole point.
 ## License
 
 MIT
+
+## FAQ
+
+**Why zero dependencies?**
+Every dep is a supply-chain risk and an install delay. Node 18+ ships `fetch`, so gitmancer needs nothing else — `curl | sh` is the whole install.
+
+**Which providers work?**
+Any OpenAI-compatible `/chat/completions` endpoint: Groq, OpenAI, OpenRouter, Z.ai, Ollama (local), vLLM, LM Studio, or a custom base URL. `aiFallbacks` mixes providers for automatic failover.
+
+**Does the agent see my tokens?**
+No. Keys live in `~/.gitmancer/config.json` (chmod 600) or env vars, are masked in output, and the system prompt forbids the model from writing them anywhere. `run_cmd` output is redacted for git push URLs.
+
+**How is this different from `gh` CLI or Copilot CLI?**
+gitmancer is an *agent loop*, not a command mapper: it plans across tools (read → edit → run → verify), streams its reasoning, and reaches your whole GitHub account — while staying one file you can actually read.
+
+**Can I use it in CI?**
+Yes: env vars (`GITMANCER_AI_KEY`, `GITMANCER_GITHUB_TOKEN`) + `--yolo` + `--json` make unattended runs scriptable. Keep `--yolo` scoped to trusted repos.
+
+**What do contributions to the graph require?**
+Commits count when the author email is linked to the GitHub account, the repo is not a fork, and the commit lands on the default branch. The linked noreply format `<id>+<login>@users.noreply.github.com` always works.
+
+**How do I speed up long agent runs?**
+Use `--fast` for simple tasks, keep tasks scoped (`--cwd` to the project), rely on the workspace snapshot instead of asking the agent to explore, raise `--steps` only when a task genuinely needs it, and set `aiFallbacks` so a rate-limited provider doesn't stall the loop.
