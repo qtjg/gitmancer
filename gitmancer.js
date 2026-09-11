@@ -15,7 +15,7 @@ const path = require("path");
 const readline = require("readline");
 const { spawnSync } = require("child_process");
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 const NAME = "gitmancer";
 const UA = `${NAME}/${VERSION}`;
 const CONFIG_DIR = path.join(os.homedir(), ".gitmancer");
@@ -96,11 +96,11 @@ function askUser(q) {
 /* ---------------- config ---------------- */
 
 const PRESETS = {
-  groq: { base: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
-  openai: { base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
-  openrouter: { base: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
-  zai: { base: "https://api.z.ai/api/paas/v4", model: "glm-4.6" },
-  ollama: { base: "http://127.0.0.1:11434/v1", model: "llama3.1" },
+  groq: { base: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile", fast: "llama-3.1-8b-instant" },
+  openai: { base: "https://api.openai.com/v1", model: "gpt-4o-mini", fast: "gpt-4o-mini" },
+  openrouter: { base: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini", fast: "meta-llama/llama-3.1-8b-instant" },
+  zai: { base: "https://api.z.ai/api/paas/v4", model: "glm-4.6", fast: "glm-4-flash" },
+  ollama: { base: "http://127.0.0.1:11434/v1", model: "llama3.1", fast: "llama3.2" },
 };
 
 function loadConfig() {
@@ -170,27 +170,101 @@ async function gh(cfg, method, endpoint, body) {
   return data;
 }
 
-/* ---------------- AI client (OpenAI-compatible) ---------------- */
+/* ---------------- AI client (OpenAI-compatible, SSE streaming + fallback) ---------------- */
 
-async function aiChat(cfg, messages, tools) {
+function sseAccumulator(onDelta) {
+  const state = { content: "", calls: {}, finish: null, streamed: false };
+  const feed = (raw) => {
+    const line = raw.trim();
+    if (!line.startsWith("data:")) return;
+    const payload = line.slice(5).trim();
+    if (!payload || payload === "[DONE]") return;
+    let j;
+    try {
+      j = JSON.parse(payload);
+    } catch {
+      return;
+    }
+    const ch = j.choices && j.choices[0];
+    if (!ch) return;
+    const d = ch.delta || {};
+    if (d.content) {
+      state.content += d.content;
+      state.streamed = true;
+      if (onDelta) onDelta(d.content);
+    }
+    if (d.tool_calls) {
+      for (const tc of d.tool_calls) {
+        const i = tc.index || 0;
+        if (!state.calls[i]) state.calls[i] = { id: "", type: "function", function: { name: "", arguments: "" } };
+        if (tc.id) state.calls[i].id = tc.id;
+        if (tc.function && tc.function.name) state.calls[i].function.name += tc.function.name;
+        if (tc.function && tc.function.arguments) state.calls[i].function.arguments += tc.function.arguments;
+      }
+    }
+    if (ch.finish_reason) state.finish = ch.finish_reason;
+  };
+  return {
+    get message() {
+      const ids = Object.keys(state.calls).sort((a, b) => a - b);
+      const message = { role: "assistant", content: state.content };
+      if (ids.length) message.tool_calls = ids.map((i) => state.calls[i]);
+      return message;
+    },
+    get streamed() {
+      return state.streamed;
+    },
+    async consume(res) {
+      const decoder = new TextDecoder();
+      let buf = "";
+      const reader = res.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) !== -1) {
+          feed(buf.slice(0, idx));
+          buf = buf.slice(idx + 1);
+        }
+      }
+      if (buf.trim()) feed(buf);
+      if (!state.content && !Object.keys(state.calls).length) {
+        throw new UserErr("AI stream ended without content (check model name / provider support)");
+      }
+    },
+  };
+}
+
+async function aiChat(cfg, messages, tools, opts = {}) {
   const isLocal = /localhost|127\.0\.0\.1/.test(cfg.aiBase);
   if (!cfg.aiKey && !isLocal) {
     throw new UserErr("No AI key. Run `gitmancer setup` or export GITMANCER_AI_KEY.");
   }
-  const body = { model: cfg.aiModel, messages, temperature: 0.2 };
-  if (tools && tools.length) body.tools = tools;
-  let res;
-  try {
-    res = await fetch(cfg.aiBase.replace(/\/$/, "") + "/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(cfg.aiKey ? { Authorization: `Bearer ${cfg.aiKey}` } : {}),
-      },
-      body: JSON.stringify(body),
-    });
-  } catch (e) {
-    throw new UserErr(`AI request failed: ${e.message} (check GITMANCER_AI_BASE: ${cfg.aiBase})`);
+  const url = cfg.aiBase.replace(/\/$/, "") + "/chat/completions";
+  const headers = {
+    "Content-Type": "application/json",
+    ...(cfg.aiKey ? { Authorization: `Bearer ${cfg.aiKey}` } : {}),
+  };
+  const payload = { model: cfg.aiModel, messages, temperature: 0.2 };
+  if (tools && tools.length) payload.tools = tools;
+  if (opts.stream) payload.stream = true;
+  const once = async () => {
+    try {
+      return await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
+    } catch (e) {
+      throw new UserErr(`AI request failed: ${e.message} (check GITMANCER_AI_BASE: ${cfg.aiBase})`);
+    }
+  };
+  let res = await once();
+  if (opts.stream) {
+    const ctype = (res.headers.get("content-type") || "").toLowerCase();
+    if (res.ok && ctype.includes("text/event-stream")) {
+      const acc = sseAccumulator(opts.onDelta);
+      await acc.consume(res);
+      return { message: acc.message, streamed: acc.streamed };
+    }
+    if (!res.ok) res = await once(); // provider may not support streaming — retry buffered
   }
   const text = await res.text();
   let json;
@@ -205,7 +279,7 @@ async function aiChat(cfg, messages, tools) {
   }
   const choice = json.choices && json.choices[0];
   if (!choice || !choice.message) throw new UserErr(`AI returned no choices: ${capOut(text, 300)}`);
-  return choice.message;
+  return { message: choice.message, streamed: false };
 }
 
 /* ---------------- agent tools ---------------- */
@@ -376,8 +450,35 @@ async function runTool(name, args, ctx) {
 
 /* ---------------- agent loop ---------------- */
 
+function buildSnapshot(cwd) {
+  const parts = [];
+  try {
+    const tree = toolListFiles(cwd, ".").split("\n");
+    const shown = tree.slice(0, 45);
+    parts.push("Files:\n" + shown.join("\n") + (tree.length > 45 ? `\n…(+${tree.length - 45} more — use list_files)` : ""));
+  } catch {}
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(cwd, "package.json"), "utf8"));
+    parts.push(
+      `package.json: ${pkg.name || "?"} v${pkg.version || "?"}` +
+        (pkg.description ? ` — ${String(pkg.description).slice(0, 120)}` : "") +
+        (pkg.scripts ? ` | scripts: ${Object.keys(pkg.scripts).join(", ")}` : "")
+    );
+  } catch {}
+  try {
+    const rd = fs.readFileSync(path.join(cwd, "README.md"), "utf8");
+    if (rd.trim()) parts.push(`README (excerpt): ${capOut(rd.trim(), 500)}`);
+  } catch {}
+  try {
+    const branch = gitOut(["rev-parse", "--abbrev-ref", "HEAD"], cwd);
+    const last = gitOut(["log", "--oneline", "-1"], cwd);
+    parts.push(`git: branch=${branch} | last commit: ${last}`);
+  } catch {}
+  return capOut(parts.join("\n\n"), 2400);
+}
+
 function systemPrompt(ctx) {
-  return [
+  const lines = [
     `You are ${NAME} v${VERSION}, an autonomous coding and GitHub agent running in the user's terminal.`,
     `Workspace (cwd): ${ctx.cwd}`,
     `OS: ${os.platform()} ${os.arch()} | Node ${process.version} | Date: ${new Date().toISOString().slice(0, 10)}`,
@@ -390,7 +491,15 @@ function systemPrompt(ctx) {
     "- If something fails, read the error and try a reasonable fix; never repeat the exact same failing call more than twice.",
     "- When the task is complete, reply with a SHORT summary of what changed and a suggested next step.",
     "- Never print, log, or write the user's tokens or API keys anywhere. Never put tokens in file content or commands.",
-  ].join("\n");
+  ];
+  if (ctx.snapshot) {
+    lines.push(
+      "",
+      "WORKSPACE SNAPSHOT (auto-generated just now — trust it; skip list_files/read_file when this already answers the question):",
+      ctx.snapshot
+    );
+  }
+  return lines.join("\n");
 }
 
 function trimHistory(messages) {
@@ -399,18 +508,46 @@ function trimHistory(messages) {
   messages.splice(1, messages.length - 1 - keep);
 }
 
+function applyFast(cfg, flags) {
+  if (!flags || !flags.fast) return cfg;
+  if (process.env.GITMANCER_AI_MODEL) return cfg; // explicit env model always wins
+  const p = PRESETS[cfg.preset];
+  if (p && p.fast && cfg.aiModel === p.model) return { ...cfg, aiModel: p.fast, __fast: true };
+  return cfg;
+}
+
+function mkCtx(flags, cfg) {
+  const ctx = {
+    cwd: path.resolve((flags && flags.cwd) || process.cwd()),
+    yolo: !!(flags && flags.yolo),
+    always: { value: false },
+    cfg,
+  };
+  try {
+    ctx.snapshot = buildSnapshot(ctx.cwd);
+  } catch {}
+  return ctx;
+}
+
 async function agentTurn(cfg, messages, ctx) {
   for (let step = 0; step < MAX_STEPS; step++) {
     let msg;
+    let streamed = false;
     try {
-      msg = await aiChat(cfg, messages, TOOLS);
+      const r = await aiChat(cfg, messages, TOOLS, {
+        stream: true,
+        onDelta: (t) => process.stdout.write(t),
+      });
+      msg = r.message;
+      streamed = r.streamed;
     } catch (e) {
       fail(e.message);
       return "error";
     }
     const calls = msg.tool_calls || [];
     if (!calls.length) {
-      console.log((msg.content || dim("(no answer)")) + "\n");
+      if (streamed) process.stdout.write("\n\n");
+      else console.log((msg.content || dim("(no answer)")) + "\n");
       messages.push({ role: "assistant", content: msg.content || "" });
       return "done";
     }
@@ -525,13 +662,9 @@ async function cmdRepos(flags) {
 }
 
 async function cmdAsk(pos, flags) {
-  const cfg = loadConfig();
-  const ctx = {
-    cwd: path.resolve(flags.cwd || process.cwd()),
-    yolo: !!flags.yolo,
-    always: { value: false },
-    cfg,
-  };
+  const cfg = applyFast(loadConfig(), flags);
+  if (cfg.__fast) console.log(dim(`fast mode → ${cfg.aiModel}`));
+  const ctx = mkCtx(flags, cfg);
   const sys = systemPrompt(ctx);
   const messages = [{ role: "system", content: sys }];
   banner();
@@ -596,7 +729,7 @@ async function aiCommitMessage(cfg, root) {
     recent = gitOut(["log", "--oneline", "-5"], root);
   } catch {}
   try {
-    const ai = await aiChat(cfg, [
+    const { message: ai } = await aiChat(cfg, [
       {
         role: "system",
         content:
@@ -724,6 +857,112 @@ async function cmdIssue(pos, flags) {
   }
 }
 
+/* ---------------- fix: auto-repair a failing command ---------------- */
+
+async function cmdFix(pos, flags) {
+  const command = pos.join(" ").trim();
+  if (!command) throw new UserErr('usage: gitmancer fix "<command>"  — e.g. gitmancer fix "npm test"');
+  const cfg = applyFast(loadConfig(), flags);
+  if (cfg.__fast) console.log(dim(`fast mode → ${cfg.aiModel}`));
+  const ctx = mkCtx(flags, cfg);
+  banner();
+  console.log(dim(`$ ${command}\n`));
+  let r = runShell(command, ctx.cwd);
+  console.log(capOut(r.out || "(no output)", 2000) + "\n");
+  if (r.code === 0) return ok("exit 0 — command already passes, nothing to fix");
+  warn(`exit ${r.code} — agent takes over, diagnosing…\n`);
+  const messages = [
+    { role: "system", content: systemPrompt(ctx) },
+    {
+      role: "user",
+      content: `The command \`${command}\` just failed with exit code ${r.code}.\n\nCombined output (stdout+stderr):\n${r.out}\n\nDiagnose the root cause, make the minimal correct fix with your tools, then re-run \`${command}\` via run_cmd to verify it exits 0. Do not touch unrelated code.`,
+    },
+  ];
+  const status = await agentTurn(cfg, messages, ctx);
+  console.log(dim("\n── verify ──"));
+  r = runShell(command, ctx.cwd);
+  console.log(dim(capOut(r.out || "(no output)", 1500)));
+  if (r.code === 0) ok("FIXED — command now exits 0 ⚡");
+  else fail(`still exit ${r.code}${status === "done" ? " — inspect the output above or run fix again" : ""}`);
+  console.log("");
+}
+
+/* ---------------- pr: open a pull request (AI-drafted) ---------------- */
+
+function parseOriginRepo(cwd) {
+  try {
+    const url = gitOut(["remote", "get-url", "origin"], cwd).replace(/\.git\/?$/, "");
+    const m = url.match(/[/:]([^/]+)\/([^/]+)$/);
+    if (m) return m[1] + "/" + m[2];
+  } catch {}
+  return null;
+}
+
+async function aiPrDraft(cfg, root, base) {
+  let log = "";
+  let stat = "";
+  try {
+    log = gitOut(["log", `origin/${base}..HEAD`, "--oneline"], root);
+  } catch {
+    try {
+      log = gitOut(["log", "--oneline", "-8"], root);
+    } catch {}
+  }
+  try {
+    stat = gitOut(["diff", "--stat", `origin/${base}...HEAD`], root);
+  } catch {}
+  try {
+    const { message } = await aiChat(cfg, [
+      {
+        role: "system",
+        content:
+          "You draft GitHub pull requests. First line: PR title (conventional-commit style, max 60 chars, no quotes/backticks). Then one blank line, then a SHORT markdown body (2-5 bullets: what changed & why). Nothing else.",
+      },
+      { role: "user", content: `Commits:\n${log || "(none)"}\n\nDiff stat:\n${capOut(stat, 1200) || "(none)"}` },
+    ]);
+    const text = String(message.content || "").trim();
+    const nl = text.indexOf("\n");
+    const title = (nl === -1 ? text : text.slice(0, nl)).replace(/[`"']/g, "").trim().slice(0, 60);
+    const body = nl === -1 ? "" : text.slice(nl + 1).trim();
+    return { title: title || `Merge ${base} updates`, body };
+  } catch (e) {
+    warn(`AI PR draft failed (${e.message}) — using fallback title`);
+    return null;
+  }
+}
+
+async function cmdPr(pos, flags) {
+  const cfg = applyFast(loadConfig(), flags);
+  if (cfg.__fast) console.log(dim(`fast mode → ${cfg.aiModel}`));
+  const root = gitRoot(process.cwd());
+  if (!root && !flags.repo) throw new UserErr("Not inside a git repo — pass --repo owner/name (and --head), or cd into your project.");
+  const base = typeof flags.base === "string" ? flags.base : "main";
+  const repo = (typeof flags.repo === "string" && flags.repo) || parseOriginRepo(root);
+  if (!repo || !repo.includes("/")) throw new UserErr("cannot determine the repo — pass --repo owner/name");
+  const head = (typeof flags.head === "string" && flags.head) || (root ? gitOut(["rev-parse", "--abbrev-ref", "HEAD"], root) : null);
+  if (!head) throw new UserErr("cannot determine current branch — pass --head <branch>");
+  if (head === base) throw new UserErr(`head (${head}) equals base (${base}) — commit your work on a feature branch first`);
+  banner();
+  let draft;
+  const titleFlag = typeof flags.title === "string" ? flags.title : null;
+  if (titleFlag) {
+    draft = { title: titleFlag, body: typeof flags.body === "string" ? flags.body : "" };
+  } else {
+    console.log(dim("drafting PR title & body with AI…"));
+    draft = (await aiPrDraft(cfg, root, base)) || { title: `Merge ${head} into ${base}`, body: "" };
+  }
+  console.log(
+    `\n  ${bold("repo :")} ${repo}\n  ${bold("head :")} ${head} → ${bold("base:")} ${base}\n  ${bold("title:")} ${draft.title}${
+      draft.body ? `\n  ${bold("body :")}\n${draft.body.split("\n").map((l) => "  " + l).join("\n")}` : ""
+    }\n`
+  );
+  const ctx = { cwd: root || process.cwd(), yolo: !!flags.yolo, always: { value: false }, cfg };
+  if (!(await allow(`open PR ${head} → ${base} on ${repo}`, ctx))) return warn("aborted — no PR created");
+  const pr = await gh(cfg, "POST", `/repos/${repo}/pulls`, { title: draft.title, head, base, body: draft.body || "" });
+  ok(`PR #${pr.number} opened → ${pr.html_url}`);
+  console.log("");
+}
+
 /* ---------------- help / arg parsing / main ---------------- */
 
 function help() {
@@ -738,11 +977,15 @@ ${bold("COMMANDS")}
   ${cyan("whoami")}                 verify GitHub token — who are you on GitHub?
   ${cyan("repos")}                  list your repositories           ${dim("--limit 50")}
   ${cyan("ask")} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
-                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --cwd <dir>')}
+                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --cwd <dir>')}
+  ${cyan('fix')} "<cmd>"            run a command; if it fails, the agent auto-fixes the code & re-verifies
+                    ${dim('--yolo  --fast  --cwd <dir>')}
   ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
   ${cyan("newrepo")} <name>         create GitHub repo + optionally push a folder in one shot
                     ${dim("--private  --source <dir>  --desc \"…\"  --m \"initial commit msg\"")}
   ${cyan("issue")} <owner/repo> …   list | create "Title" [--body "…"] | close <number>
+  ${cyan("pr")}                    open a pull request — AI drafts title & body from your commits
+                    ${dim('--base main  --head <branch>  --repo owner/name  --title "…"  --body "…"  --yolo')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -756,13 +999,15 @@ ${bold("SAFETY")}
 ${bold("EXAMPLES")}
   gitmancer ask "what does this repo do? then fix the typo in README"
   gitmancer ask --yolo "add tests for utils.js and run them"
+  gitmancer fix "npm test"                ${dim("# tests failing? the agent repairs code & re-verifies")}
+  gitmancer pr --base main                ${dim("# AI-drafted PR from your current branch")}
   gitmancer ship
   gitmancer newrepo my-side-project --private --source ./my-side-project
   gitmancer issue me/myrepo create "Bug: login fails on Safari"
 `);
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -814,6 +1059,8 @@ async function main() {
     case "ship": return cmdShip(pos, flags);
     case "newrepo": return cmdNewRepo(pos, flags);
     case "issue": return cmdIssue(pos, flags);
+    case "fix": return cmdFix(pos, flags);
+    case "pr": return cmdPr(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);

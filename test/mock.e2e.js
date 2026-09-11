@@ -14,6 +14,7 @@ const ROOT = path.resolve(__dirname, "..");
 const CLI = path.join(ROOT, "gitmancer.js");
 
 let aiCalls = 0;
+let fixCalls = 0;
 const failed = [];
 
 function check(name, cond) {
@@ -29,39 +30,76 @@ function respond(res, obj) {
   res.end(JSON.stringify(obj));
 }
 
+function sseRespond(res, message) {
+  res.writeHead(200, { "Content-Type": "text/event-stream" });
+  const send = (obj) => res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  send({ choices: [{ delta: { role: "assistant", content: "" } }] });
+  if (message.content) {
+    const half = Math.ceil(message.content.length / 2);
+    send({ choices: [{ delta: { content: message.content.slice(0, half) } }] });
+    send({ choices: [{ delta: { content: message.content.slice(half) } }] });
+  }
+  (message.tool_calls || []).forEach((tc, i) => {
+    send({ choices: [{ delta: { tool_calls: [{ index: i, id: tc.id, type: "function", function: { name: tc.function.name, arguments: "" } }] } }] });
+    send({ choices: [{ delta: { tool_calls: [{ index: i, function: { arguments: tc.function.arguments } }] } }] });
+  });
+  send({ choices: [{ delta: {}, finish_reason: message.tool_calls && message.tool_calls.length ? "tool_calls" : "stop" }] });
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
 const server = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
     if (req.url.includes("/chat/completions")) {
       aiCalls++;
-      if (aiCalls % 2 === 1) {
-        // odd call → request a file write (so both yolo and deny scenarios work)
-        respond(res, {
-          choices: [
-            {
-              message: {
+      let reqBody = {};
+      try {
+        reqBody = JSON.parse(body || "{}");
+      } catch {}
+      const lastUser = ((reqBody.messages || []).filter((m) => m.role === "user").pop() || {}).content || "";
+      let message;
+      if (/just failed with exit code/.test(String(lastUser))) {
+        // fix flow: 1st call → write app.js, 2nd call → final text
+        fixCalls++;
+        message =
+          fixCalls % 2 === 1
+            ? {
                 role: "assistant",
                 content: null,
                 tool_calls: [
                   {
-                    id: `call_${aiCalls}`,
+                    id: `fix_${fixCalls}`,
                     type: "function",
-                    function: {
-                      name: "write_file",
-                      arguments: JSON.stringify({ path: "hello.txt", content: "hello from gitmancer" }),
-                    },
+                    function: { name: "write_file", arguments: JSON.stringify({ path: "app.js", content: "console.log('ok');\n" }) },
                   },
                 ],
+              }
+            : { role: "assistant", content: "Wrote the missing app.js — syntax is valid now." };
+      } else if (aiCalls % 2 === 1) {
+        // odd call → request a file write (so both yolo and deny scenarios work)
+        message = {
+          role: "assistant",
+          content: null,
+          tool_calls: [
+            {
+              id: `call_${aiCalls}`,
+              type: "function",
+              function: {
+                name: "write_file",
+                arguments: JSON.stringify({ path: "hello.txt", content: "hello from gitmancer" }),
               },
             },
           ],
-        });
+        };
       } else {
-        respond(res, {
-          choices: [{ message: { role: "assistant", content: "Done — handled hello.txt." } }],
-        });
+        message = { role: "assistant", content: "Done — handled hello.txt." };
       }
+      if (reqBody.stream) sseRespond(res, message);
+      else respond(res, { choices: [{ message }] });
+    } else if (req.method === "POST" && req.url.endsWith("/pulls")) {
+      respond(res, { number: 7, title: "Add widget", html_url: "https://github.com/acme/widget/pull/7" });
     } else if (req.url.endsWith("/user")) {
       respond(res, {
         login: "mayank-test",
@@ -114,6 +152,21 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
     check("hello.txt content correct", fs.readFileSync(hello, "utf8") === "hello from gitmancer");
   }
   check("two AI calls made (tool_call → final)", aiCalls >= 2);
+  check("streamed answer reaches stdout", /Done — handled hello\.txt\./.test(r.stdout || ""));
+
+  console.log("→ fix command (agent auto-repairs a failing command)");
+  const fixDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-fix-"));
+  r = await runCli(["fix", "--yolo", "node --check app.js"], fixDir, env);
+  check("fix exits 0", r.status === 0);
+  check("app.js written by fix agent", fs.existsSync(path.join(fixDir, "app.js")));
+  check("FIXED verdict shown", /FIXED/.test(r.stdout || ""));
+
+  console.log("→ pr command (confirm-gated GitHub mutation)");
+  const prDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-pr-"));
+  r = await runCli(["pr", "--repo", "acme/widget", "--title", "Add widget", "--body", "Does things", "--base", "main", "--head", "feature", "--yolo"], prDir, env);
+  check("pr exits 0", r.status === 0);
+  check("pr number shown", /#7/.test(r.stdout || ""));
+  check("pr url shown", /acme\/widget\/pull\/7/.test(r.stdout || ""));
 
   console.log("→ whoami");
   r = await runCli(["whoami"], tmp, env);
