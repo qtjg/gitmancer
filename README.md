@@ -6,7 +6,7 @@ Give it any OpenAI-compatible AI key (Groq / OpenAI / OpenRouter / Z.ai / Ollama
 GitHub token, and it becomes a terminal-native agent that reads and writes your code, runs
 commands, commits, pushes, creates repos, and manages issues — you talk, it ships.
 
-![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![deps](https://img.shields.io/badge/dependencies-0-blue) ![license](https://img.shields.io/badge/license-MIT-orange) ![version](https://img.shields.io/badge/version-0.2.0-purple)
+![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![deps](https://img.shields.io/badge/dependencies-0-blue) ![license](https://img.shields.io/badge/license-MIT-orange) ![version](https://img.shields.io/badge/version-0.3.0-purple)
 
 ```bash
 $ gitmancer ask "add input validation to signup.js and run the tests"
@@ -21,13 +21,24 @@ commit: feat(auth): validate signup inputs + rate-limit guard
 ✔ pushed main → origin
 ```
 
-## What's new in v0.2.0 — faster & more effective
+## What's new in v0.3.0 — speed & account-scale
 
-- **Streaming output** — answers print token-by-token as the model thinks (SSE), with automatic fallback to buffered mode for providers that don't stream
-- **`gitmancer fix "<cmd>"`** — run any command; if it fails, the agent diagnoses the error, patches the code, and re-verifies until it exits 0
-- **`gitmancer pr`** — opens a pull request with an AI-drafted title & body from your commits and diff
-- **Workspace snapshot** — the system prompt is preloaded with your file tree, `package.json` metadata, README excerpt and git state, so the agent skips exploration steps and burns fewer tokens
-- **`--fast` flag** — one-flag switch to each provider's small model (`groq` → `llama-3.1-8b-instant`, `zai` → `glm-4-flash`, …) for quick tasks
+- **Retry + fallback chain** — transient AI errors (429/5xx) retry with exponential backoff (respects `Retry-After`); add `aiFallbacks` to your config and gitmancer fails over to the next provider/model instead of dying
+- **GitHub GET cache** — identical API reads are served from a 10-minute in-process cache (mutations invalidate it, `--no-cache` bypasses) → sweeps and status views are dramatically faster and burn less rate limit
+- **`gitmancer review <pr#>`** — AI code review of any pull request: severity-tagged findings (`[blocking]`/`[major]`/`[minor]`/`[nit]`) + an APPROVE / REQUEST CHANGES verdict
+- **`gitmancer sweep`** — concurrent batch overview of *all* your repos: open issues, PRs, stars, last push
+- **`gitmancer status`** — branch, dirty files, ahead/behind, open issues/PRs, last CI run — one command (`--json` for scripts)
+- **`gitmancer doctor`** — checks config, keys, fallback shape, GitHub/AI endpoints and tells you exactly what's broken
+- **Context compaction v2** — long sessions compact safely at user-message boundaries (never mid tool-call), so marathon agent turns stay fast
+- **Agent tool upgrades** — `run_cmd` gains a `timeout_ms` guard, `read_file` gains `offset`/`limit` pagination for big files
+- **`--json` output** for `status` and `sweep` — pipe into `jq`, drive from scripts
+
+<details>
+<summary>What was new in v0.2.0</summary>
+
+- **Streaming output** (SSE with buffered fallback) · **`fix "<cmd>"`** auto-repair · **`pr`** with AI-drafted title/body · **workspace snapshot** in the system prompt · **`--fast`** small-model switch
+
+</details>
 
 ## Why
 
@@ -38,7 +49,15 @@ keys you already have.
 
 ## Install
 
-**Option A — single file (no install):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/qtjg/gitmancer/main/install.sh | sh
+
+# or pin a version / uninstall
+curl -fsSL https://raw.githubusercontent.com/qtjg/gitmancer/main/install.sh | sh -s v0.3.0
+gitmancer uninstall
+```
+
+**Option B — single file (no install):**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/qtjg/gitmancer/main/gitmancer.js -o gitmancer.js
@@ -86,8 +105,12 @@ never printed (last 4 chars only), and never sent anywhere except their own APIs
 | `gitmancer ship ["msg"]` | stage all, AI-generated commit message (if omitted), push |
 | `gitmancer newrepo <name>` | create a GitHub repo via API; `--source .` also init + commit + push |
 | `gitmancer issue <owner/repo> …` | `list` · `create "Title" --body "…"` · `close 12` |
+| `gitmancer review <pr#>` | AI code review of a PR — findings + verdict (`--repo owner/name`) |
+| `gitmancer status` | dashboard: branch, dirty files, sync state, open issues/PRs, CI (`--json`) |
+| `gitmancer sweep` | batch overview of all your repos — open counts per repo (`--json`) |
+| `gitmancer doctor` | diagnose config, keys, endpoints, fallbacks |
 
-**Useful flags:** `--yolo` (skip confirmations for unattended runs) · `--fast` (small model per preset) · `--private` · `--limit N` · `--cwd <dir>`
+**Useful flags:** `--yolo` (skip confirmations for unattended runs) · `--fast` (small model per preset) · `--no-cache` (bypass GitHub GET cache) · `--json` · `--private` · `--limit N` · `--cwd <dir>`
 
 ### The agent loop
 
@@ -112,8 +135,25 @@ allow everything for the session. `--yolo` skips all prompts (great for CI, care
 | `ollama` | `http://127.0.0.1:11434/v1` | `llama3.1` |
 | `custom` | your URL | your model |
 
-Env-var overrides (CI-friendly): `GITMANCER_AI_KEY`, `GITMANCER_AI_BASE`, `GITMANCER_AI_MODEL`,
-`GITMANCER_GITHUB_TOKEN`, `GITMANCER_GH_BASE` (also handy for GitHub Enterprise).
+Env-var overrides (CI-friendly): `GITMANCER_AI_KEY`, `GITMANCER_AI_BASE`, `GITMANCER_AI_MODEL`, `GITMANCER_GITHUB_TOKEN`, `GITMANCER_GH_BASE` (also handy for GitHub Enterprise), `GITMANCER_CMD_TIMEOUT` (default run_cmd timeout, ms).
+
+### Reliability: retry & fallbacks
+
+AI calls retry transient failures automatically (429/5xx, exponential backoff, `Retry-After` honored). For provider outages, add a fallback chain to `~/.gitmancer/config.json`:
+
+```json
+{
+  "preset": "groq",
+  "aiBase": "https://api.groq.com/openai/v1",
+  "aiModel": "llama-3.3-70b-versatile",
+  "aiFallbacks": [
+    { "base": "https://openrouter.ai/api/v1", "model": "openai/gpt-4o-mini", "key": "sk-or-…" },
+    { "base": "http://127.0.0.1:11434/v1", "model": "llama3.1" }
+  ]
+}
+```
+
+If the primary fails, gitmancer walks the chain and tells you which fallback served the request. Verify the whole setup with `gitmancer doctor`.
 
 ## Security
 
@@ -126,18 +166,19 @@ Env-var overrides (CI-friendly): `GITMANCER_AI_KEY`, `GITMANCER_AI_BASE`, `GITMA
 
 ## Roadmap
 
-- [x] `gitmancer pr` — AI-drafted pull requests (v0.2.0)
 - [x] streaming output + `fix` auto-repair + `--fast` mode (v0.2.0)
-- [ ] PR **review** mode: diff → AI review comment posted to the PR
+- [x] PR **review** command — AI findings + verdict (v0.3.0)
+- [x] multi-repo `sweep` + `status` dashboard + `doctor` (v0.3.0)
+- [x] `--json` output mode for scripting (v0.3.0)
+- [x] retry on transient AI errors + provider fallback chain (v0.3.0)
 - [ ] scheduled farming mode: commit queues + planned pushes
 - [ ] repo templates: `newrepo --template node-lib` scaffolds + pushes a full project
-- [ ] multi-repo sweeps: "bump version + changelog + push" across all repos
-- [ ] `--json` output mode for scripting
+- [ ] session persistence: resume an interrupted `ask --chat` where you left off
+- [ ] MCP server support: expose gitmancer tools to other agents
 
 ## Contributing
 
-PRs welcome — keep it zero-dependency, that's the whole point. `npm test` runs the mock
-end-to-end suite (no keys needed).
+PRs welcome — keep it zero-dependency and single-file, that's the whole point. Read [CONTRIBUTING.md](CONTRIBUTING.md), then: `node --check gitmancer.js && node test/mock.e2e.js` (no keys needed). Found a security issue? See [SECURITY.md](SECURITY.md).
 
 ## License
 
