@@ -1,16 +1,32 @@
-name: CI
+name: ci
 
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 jobs:
-  check:
+  test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node }}
+
       - name: Syntax check
-        run: node --check gitmancer.js
-      - name: End-to-end mock tests
+        run: node --check gitmancer.js && node --check test/mock.e2e.js
+
+      - name: Version smoke
+        run: node gitmancer.js version
+
+      - name: Help smoke
+        run: node gitmancer.js help
+
+      - name: End-to-end tests (mock AI + mock GitHub)
         run: node test/mock.e2e.js
