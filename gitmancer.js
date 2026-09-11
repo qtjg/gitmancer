@@ -364,8 +364,10 @@ const TOOLS = [
   t("list_files", "List files and folders under a path in the user's workspace. Always explore before editing.", {
     path: { type: "string", description: "Relative path from workspace root (default '.')" },
   }),
-  t("read_file", "Read a text file from the workspace.", {
+  t("read_file", "Read a text file from the workspace. For large files pass offset/limit to page through it (1-based lines).", {
     path: { type: "string", description: "Relative file path" },
+    offset: { type: "number", description: "First line to return (1-based). Default 1." },
+    limit: { type: "number", description: "Max lines to return. Default: whole file (capped at 2000 lines)." },
   }, ["path"]),
   t("write_file", "Create or overwrite a file in the workspace with full content.", {
     path: { type: "string", description: "Relative file path" },
@@ -475,7 +477,13 @@ async function runTool(name, args, ctx) {
 
       case "read_file": {
         const abs = safePath(cwd, args.path);
-        return capOut(fs.readFileSync(abs, "utf8"), 20000);
+        const raw = capOut(fs.readFileSync(abs, "utf8"), 20000);
+        const lines = raw.split("\n");
+        const off = Math.max(parseInt(args.offset, 10) || 1, 1);
+        const lim = Math.min(Math.max(parseInt(args.limit, 10) || 2000, 1), 2000);
+        const slice = lines.slice(off - 1, off - 1 + lim);
+        const head = `lines ${off}-${off - 1 + slice.length} of ${lines.length}`;
+        return (slice.length === lines.length && off === 1 ? raw : `[${head}]\n` + slice.join("\n"));
       }
 
       case "write_file": {
