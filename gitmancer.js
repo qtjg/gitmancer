@@ -896,13 +896,36 @@ async function cmdShip(pos, flags) {
   console.log("");
 }
 
+function scaffoldNodeLib(name) {
+  const safe = String(name || "my-lib").toLowerCase().replace(/[^a-z0-9._-]/g, "-");
+  return {
+    "package.json": JSON.stringify(
+      {
+        name: safe,
+        version: "0.1.0",
+        description: "",
+        main: "index.js",
+        scripts: { test: "node test/run.js" },
+        keywords: [],
+        license: "MIT",
+      },
+      null,
+      2
+    ) + "\n",
+    "index.js": '"use strict";\n\nfunction hello(who = "world") {\n  return `hello ${who}`;\n}\n\nmodule.exports = { hello };\n',
+    "test/run.js": '"use strict";\nconst assert = require("assert");\nconst { hello } = require("..");\n\nassert.strictEqual(hello(), "hello world");\nassert.strictEqual(hello("gitmancer"), "hello gitmancer");\nconsole.log("test/run.js — all assertions passed");\n',
+    ".gitignore": "node_modules/\n*.log\n.DS_Store\n",
+  };
+}
+
 async function cmdNewRepo(pos, flags) {
   const cfg = loadConfig();
   const name = pos[0];
-  if (!name) throw new UserErr('usage: gitmancer newrepo <name> [--private] [--source <dir>] [--desc "..."] [--m "commit message"]');
+  if (!name) throw new UserErr('usage: gitmancer newrepo <name> [--private] [--source <dir>] [--desc "..."] [--m "commit message"] [--template node-lib]');
   banner();
   const priv = !!flags.private;
-  console.log(dim(`creating ${priv ? "private" : "public"} repo ${name} via GitHub API…`));
+  const tpl = flags.template === "node-lib" ? "node-lib" : null;
+  console.log(dim(`creating ${priv ? "private" : "public"} repo ${name}${tpl ? ` from ${tpl} template` : ""} via GitHub API…`));
   const repo = await gh(cfg, "POST", "/user/repos", {
     name,
     private: priv,
@@ -914,6 +937,19 @@ async function cmdNewRepo(pos, flags) {
   const src = flags.source ? path.resolve(flags.source) : null;
   if (src) {
     if (!fs.existsSync(src)) throw new UserErr(`source dir not found: ${src}`);
+    if (tpl) {
+      const files = scaffoldNodeLib(name);
+      let made = 0;
+      for (const [rel, content] of Object.entries(files)) {
+        const abs = path.join(src, rel);
+        if (!fs.existsSync(abs)) {
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, content);
+          made += 1;
+        }
+      }
+      ok(`scaffolded ${tpl} template (${made} file(s)) into ${src}`);
+    }
     console.log(dim(`pushing ${src} …`));
     if (!fs.existsSync(path.join(src, ".git"))) gitOut(["init", "-b", "main"], src);
     gitOut(["add", "-A"], src);
@@ -1362,7 +1398,7 @@ ${bold("COMMANDS")}
   ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
                     ${dim('--no-push (commit locally only)')}
   ${cyan("newrepo")} <name>         create GitHub repo + optionally push a folder in one shot
-                    ${dim("--private  --source <dir>  --desc \"…\"  --m \"initial commit msg\"")}
+                    ${dim("--private  --source <dir>  --desc \"…\"  --m \"initial commit msg\"  --template node-lib")}
   ${cyan("issue")} <owner/repo> …   list | create "Title" [--body "…"] | close <number> | reopen <number>
                     ${dim('--state all|open|closed  --limit N  --json')}
   ${cyan("pr")}                    open a pull request — AI drafts title & body from your commits
