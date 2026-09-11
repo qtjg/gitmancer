@@ -129,11 +129,36 @@ function saveConfig(cfg) {
   } catch {}
 }
 
-/* ---------------- GitHub API client ---------------- */
+/* ---------------- GitHub API client (GET cache + redaction) ---------------- */
 
-async function gh(cfg, method, endpoint, body) {
+const GH_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const _ghCache = new Map(); // method+endpoint → { t, data }
+
+function ghCacheGet(key) {
+  const e = _ghCache.get(key);
+  if (e && Date.now() - e.t < GH_CACHE_TTL) return e.data;
+  _ghCache.delete(key);
+  return null;
+}
+
+function ghCacheSet(key, data) {
+  _ghCache.set(key, { t: Date.now(), data });
+}
+
+function ghCacheClear() {
+  _ghCache.clear();
+}
+
+async function gh(cfg, method, endpoint, body, opts = {}) {
   if (!cfg.githubToken) {
     throw new UserErr("No GitHub token. Run `gitmancer setup` or export GITMANCER_GITHUB_TOKEN.");
+  }
+  method = method.toUpperCase();
+  const cacheable = method === "GET" && opts.cache !== false;
+  const ckey = method + " " + endpoint;
+  if (cacheable) {
+    const hit = ghCacheGet(ckey);
+    if (hit !== null) return hit;
   }
   const url = endpoint.startsWith("http") ? endpoint : cfg.ghBase.replace(/\/$/, "") + endpoint;
   let res;
@@ -169,6 +194,8 @@ async function gh(cfg, method, endpoint, body) {
     if (res.status === 422 && data && data.errors) hint = " — " + JSON.stringify(data.errors).slice(0, 200);
     throw new UserErr(`GitHub ${res.status}: ${msg}${hint}`);
   }
+  if (cacheable) ghCacheSet(ckey, data);
+  else ghCacheClear(); // any successful mutation invalidates cached reads
   return data;
 }
 
@@ -478,7 +505,7 @@ async function runTool(name, args, ctx) {
         if (method !== "GET" && !(await allow(desc, ctx))) {
           return "DENIED by user — do not retry this same call; propose an alternative.";
         }
-        const data = await gh(ctx.cfg, method, endpoint, args.body);
+        const data = await gh(ctx.cfg, method, endpoint, args.body, { cache: !ctx.noCache });
         return capOut(typeof data === "string" ? data : JSON.stringify(data, null, 2), 6000);
       }
 
@@ -562,6 +589,7 @@ function mkCtx(flags, cfg) {
   const ctx = {
     cwd: path.resolve((flags && flags.cwd) || process.cwd()),
     yolo: !!(flags && flags.yolo),
+    noCache: !!(flags && flags["no-cache"]),
     always: { value: false },
     cfg,
   };
@@ -1049,7 +1077,7 @@ ${bold("EXAMPLES")}
 `);
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache"]);
 
 function parseArgs(argv) {
   let cmd = null;
