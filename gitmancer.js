@@ -634,6 +634,7 @@ function mkCtx(flags, cfg) {
     cwd: path.resolve((flags && flags.cwd) || process.cwd()),
     yolo: !!(flags && flags.yolo),
     noCache: !!(flags && flags["no-cache"]),
+    maxSteps: Math.min(Math.max(parseInt(flags && flags.steps, 10) || MAX_STEPS, 1), 100),
     always: { value: false },
     cfg,
   };
@@ -644,7 +645,7 @@ function mkCtx(flags, cfg) {
 }
 
 async function agentTurn(cfg, messages, ctx) {
-  for (let step = 0; step < MAX_STEPS; step++) {
+  for (let step = 0; step < (ctx.maxSteps || MAX_STEPS); step++) {
     let msg;
     let streamed = false;
     try {
@@ -686,7 +687,7 @@ async function agentTurn(cfg, messages, ctx) {
     }
     trimHistory(messages);
   }
-  warn(`stopped after ${MAX_STEPS} steps — continue with a follow-up message if needed`);
+  warn(`stopped after ${ctx.maxSteps || MAX_STEPS} steps — continue with a follow-up message, or raise --steps`);
   return "max_steps";
 }
 
@@ -1354,8 +1355,8 @@ ${bold("COMMANDS")}
   ${cyan("config")}                 show current config (secrets masked)
   ${cyan("whoami")}                 verify GitHub token — who are you on GitHub?
   ${cyan("repos")}                  list your repositories           ${dim("--limit 50")}
-  ${cyan("ask")} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
-                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --cwd <dir>')}
+  ${cyan('ask')} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
+                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>')}
   ${cyan('fix')} "<cmd>"            run a command; if it fails, the agent auto-fixes the code & re-verifies
                     ${dim('--yolo  --fast  --cwd <dir>')}
   ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
