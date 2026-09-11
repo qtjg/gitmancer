@@ -27,8 +27,9 @@ class UserErr extends Error {}
 
 /* ---------------- output helpers ---------------- */
 
-const TTY = process.stdout.isTTY;
-const paint = (code, s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+const TTY = process.stdout.isTTY && !process.env.NO_COLOR;
+let FORCE_COLOR_OFF = false;
+const paint = (code, s) => (TTY && !FORCE_COLOR_OFF ? `\x1b[${code}m${s}\x1b[0m` : String(s));
 const bold = (s) => paint("1", s);
 const dim = (s) => paint("2", s);
 const green = (s) => paint("32", s);
@@ -1480,7 +1481,7 @@ ${bold("EXAMPLES")}
 `);
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -1517,6 +1518,7 @@ function parseArgs(argv) {
 async function main() {
   const argv = process.argv.slice(2);
   const { cmd, pos, flags } = parseArgs(argv);
+  if (flags["no-color"] || process.env.NO_COLOR) FORCE_COLOR_OFF = true;
   if (flags.version || flags.v) return console.log(`${NAME} v${VERSION}`);
   if (flags.help || flags.h) return help();
   if (!cmd || cmd === "help") return help();
