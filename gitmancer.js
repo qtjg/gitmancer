@@ -1173,8 +1173,11 @@ async function cmdStatus(pos, flags) {
 
 async function cmdSweep(pos, flags) {
   const cfg = loadConfig();
-  banner();
-  console.log(dim("listing your repositories…"));
+  const bannerFirst = !flags.json;
+  if (bannerFirst) {
+    banner();
+    console.log(dim("listing your repositories…"));
+  }
   const limit = parseInt(flags.limit, 10) || 30;
   const repos = await gh(cfg, "GET", `/user/repos?per_page=100&sort=pushed`);
   const mine = (repos || []).slice(0, limit);

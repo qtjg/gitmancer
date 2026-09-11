@@ -15,6 +15,9 @@ const CLI = path.join(ROOT, "gitmancer.js");
 
 let aiCalls = 0;
 let fixCalls = 0;
+let userHits = 0;
+let retryTrips = 0;
+let cacheAsks = 0;
 const failed = [];
 
 function check(name, cond) {
@@ -60,7 +63,32 @@ const server = http.createServer((req, res) => {
       } catch {}
       const lastUser = ((reqBody.messages || []).filter((m) => m.role === "user").pop() || {}).content || "";
       let message;
-      if (/just failed with exit code/.test(String(lastUser))) {
+      if (/retry test/.test(String(lastUser))) {
+        // transient-failure flow: first request → 500, retried request → final text
+        if (retryTrips++ === 0) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "transient server error" } }));
+          return;
+        }
+        message = { role: "assistant", content: "retry ok — recovered after transient 500." };
+      } else if (/cache test/.test(String(lastUser))) {
+        // cache flow: 1st call → TWO identical GET /user tool calls, 2nd → final text
+        cacheAsks++;
+        message =
+          cacheAsks % 2 === 1
+            ? {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  { id: "gh1", type: "function", function: { name: "github_api", arguments: JSON.stringify({ method: "GET", endpoint: "/user" }) } },
+                  { id: "gh2", type: "function", function: { name: "github_api", arguments: JSON.stringify({ method: "GET", endpoint: "/user" }) } },
+                ],
+              }
+            : { role: "assistant", content: "Done — two identical GETs, second served from cache." };
+      } else if (/^PR #/.test(String(lastUser))) {
+        // review flow: plain streamed text verdict, no tool calls
+        message = { role: "assistant", content: "Verdict: APPROVE — diff is minimal and correct." };
+      } else if (/just failed with exit code/.test(String(lastUser))) {
         // fix flow: 1st call → write app.js, 2nd call → final text
         fixCalls++;
         message =
@@ -100,7 +128,29 @@ const server = http.createServer((req, res) => {
       else respond(res, { choices: [{ message }] });
     } else if (req.method === "POST" && req.url.endsWith("/pulls")) {
       respond(res, { number: 7, title: "Add widget", html_url: "https://github.com/acme/widget/pull/7" });
+    } else if (req.url.endsWith("/pulls/12/diff")) {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("diff --git a/app.js b/app.js\n+console.log('ok');\n");
+    } else if (req.url.endsWith("/pulls/12")) {
+      respond(res, {
+        number: 12,
+        title: "Add widget",
+        additions: 2,
+        deletions: 0,
+        changed_files: 1,
+        head: { ref: "feature" },
+        base: { ref: "main" },
+        diff_url: `http://${req.headers.host}/repos/acme/widget/pulls/12/diff`,
+        html_url: "https://github.com/acme/widget/pull/12",
+      });
+    } else if (req.url.includes("/actions/runs")) {
+      respond(res, { workflow_runs: [{ name: "ci", status: "completed", conclusion: "success", head_branch: "main" }] });
+    } else if (req.url.startsWith("/user/repos")) {
+      respond(res, [{ full_name: "acme/widget", language: "JavaScript", stargazers_count: 3, pushed_at: "2026-09-11T12:00:00Z" }]);
+    } else if (req.url.endsWith("/repos/acme/widget")) {
+      respond(res, { full_name: "acme/widget", default_branch: "main", stargazers_count: 3 });
     } else if (req.url.endsWith("/user")) {
+      userHits++;
       respond(res, {
         login: "mayank-test",
         name: "Mayank Test",
@@ -108,6 +158,8 @@ const server = http.createServer((req, res) => {
         followers: 7,
         html_url: "https://github.com/mayank-test",
       });
+    } else if (req.url.endsWith("/models")) {
+      respond(res, { data: [{ id: "mock-model" }] });
     } else {
       respond(res, []);
     }
@@ -186,6 +238,48 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("deny run exits 0 (model told to move on)", r.status === 0);
   check("write denied — no file created", !fs.existsSync(path.join(denyDir, "hello.txt")));
   check("denial fed back to model", /DENIED/.test(r.stdout || ""));
+
+  console.log("→ GitHub GET cache (two identical calls, one server hit)");
+  const before = userHits;
+  r = await runCli(["ask", "cache test", "--yolo"], tmp, env);
+  check("cache ask exits 0", r.status === 0);
+  check("second identical GET served from cache", userHits - before === 1);
+
+  console.log("→ retry on transient AI error (500 → 200)");
+  r = await runCli(["ask", "retry test", "--yolo"], tmp, env);
+  check("retry ask exits 0", r.status === 0);
+  check("recovered after 500 — final answer shown", /retry ok/.test(r.stdout || ""));
+  check("server saw the retried request", retryTrips >= 1);
+
+  console.log("→ status --json");
+  r = await runCli(["status", "--repo", "acme/widget", "--json"], tmp, env);
+  check("status exits 0", r.status === 0);
+  let j = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {}
+  check("status json parses cleanly", !!j);
+  check("status shows repo + CI conclusion", !!(j && j.repo === "acme/widget" && j.github && j.github.lastRun && j.github.lastRun.conclusion === "success"));
+
+  console.log("→ sweep --json");
+  r = await runCli(["sweep", "--json"], tmp, env);
+  check("sweep exits 0", r.status === 0);
+  j = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {}
+  check("sweep lists repos with open counts", Array.isArray(j) && j.length >= 1 && j[0].repo === "acme/widget");
+
+  console.log("→ review (AI code review of a PR)");
+  r = await runCli(["review", "12", "--repo", "acme/widget"], tmp, env);
+  check("review exits 0", r.status === 0);
+  check("review verdict shown", /APPROVE/.test(r.stdout || ""));
+
+  console.log("→ doctor");
+  r = await runCli(["doctor"], tmp, env);
+  check("doctor exits 0", r.status === 0);
+  check("doctor reports GitHub auth", /authenticated as mayank-test/.test(r.stdout || ""));
+  check("doctor keeps secrets masked", !((r.stdout || "") + (r.stderr || "")).includes("gh_test_token_abc"));
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
