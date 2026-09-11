@@ -15,7 +15,7 @@ const path = require("path");
 const readline = require("readline");
 const { spawnSync } = require("child_process");
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 const NAME = "gitmancer";
 const UA = `${NAME}/${VERSION}`;
 const CONFIG_DIR = path.join(os.homedir(), ".gitmancer");
