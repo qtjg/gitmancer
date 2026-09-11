@@ -1077,6 +1077,63 @@ async function cmdPr(pos, flags) {
   console.log("");
 }
 
+/* ---------------- status: one-shot repo dashboard ---------------- */
+
+async function cmdStatus(pos, flags) {
+  const cfg = loadConfig();
+  const root = gitRoot(process.cwd());
+  const repo = (typeof flags.repo === "string" && flags.repo) || (root ? parseOriginRepo(root) : null);
+  const out = { repo: repo || null, local: null, github: null };
+  const rows = [];
+  if (root) {
+    const branch = gitOut(["rev-parse", "--abbrev-ref", "HEAD"], root);
+    const dirty = gitOut(["status", "--porcelain"], root).split("\n").filter(Boolean).length;
+    let counts = "";
+    try {
+      counts = gitOut(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], root);
+    } catch {}
+    const [behind, ahead] = counts ? counts.split(/\s+/) : ["0", "0"];
+    const last = gitOut(["log", "--oneline", "-1"], root);
+    out.local = { branch, dirty, ahead: Number(ahead) || 0, behind: Number(behind) || 0, last };
+    rows.push(`  ${bold("repo   ")} : ${bold(repo || dim("(no origin)"))}`);
+    rows.push(`  ${bold("branch ")} : ${cyan(branch)}${dirty ? yellow(`  ${dirty} dirty file(s)`) : green("  clean")}`);
+    rows.push(`  ${bold("sync   ")} : ${dim(`ahead ${ahead || 0}, behind ${behind || 0}`)}`);
+    rows.push(`  ${bold("last   ")} : ${dim(last)}`);
+  } else {
+    rows.push(dim("  (not inside a git repo — showing GitHub-side info only)"));
+  }
+  if (repo && cfg.githubToken) {
+    try {
+      const [r, issues, prs, runs] = await Promise.all([
+        gh(cfg, "GET", `/repos/${repo}`),
+        gh(cfg, "GET", `/repos/${repo}/issues?state=open&per_page=100`),
+        gh(cfg, "GET", `/repos/${repo}/pulls?state=open&per_page=100`),
+        gh(cfg, "GET", `/repos/${repo}/actions/runs?per_page=1`).catch(() => null),
+      ]);
+      const openIssues = (issues || []).filter((i) => !i.pull_request).length;
+      const openPrs = (prs || []).length;
+      const run = runs && runs.workflow_runs && runs.workflow_runs[0];
+      out.github = {
+        defaultBranch: r.default_branch,
+        stars: r.stargazers_count,
+        openIssues,
+        openPrs,
+        lastRun: run ? { name: run.name, status: run.status, conclusion: run.conclusion } : null,
+      };
+      rows.push(`  ${bold("issues ")} : ${openIssues} open`);
+      rows.push(`  ${bold("prs    ")} : ${openPrs} open`);
+      if (run) {
+        rows.push(`  ${bold("CI     ")} : ${run.conclusion === "success" ? green("✔ " + run.conclusion) : yellow(run.status + (run.conclusion ? "/" + run.conclusion : ""))} ${dim(run.head_branch + " · " + run.name)}`);
+      }
+    } catch (e) {
+      rows.push(yellow(`  ${bold("github ")} : ${e.message}`));
+    }
+  }
+  if (flags.json) return console.log(JSON.stringify(out, null, 2));
+  banner();
+  console.log("\n" + rows.join("\n") + "\n");
+}
+
 /* ---------------- help / arg parsing / main ---------------- */
 
 function help() {
@@ -1100,6 +1157,8 @@ ${bold("COMMANDS")}
   ${cyan("issue")} <owner/repo> …   list | create "Title" [--body "…"] | close <number>
   ${cyan("pr")}                    open a pull request — AI drafts title & body from your commits
                     ${dim('--base main  --head <branch>  --repo owner/name  --title "…"  --body "…"  --yolo')}
+  ${cyan("status")}                 dashboard: branch, dirty files, ahead/behind, open issues/PRs, last CI run
+                    ${dim('--repo owner/name  --json')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -1121,7 +1180,7 @@ ${bold("EXAMPLES")}
 `);
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -1175,6 +1234,7 @@ async function main() {
     case "issue": return cmdIssue(pos, flags);
     case "fix": return cmdFix(pos, flags);
     case "pr": return cmdPr(pos, flags);
+    case "status": return cmdStatus(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
