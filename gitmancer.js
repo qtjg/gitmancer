@@ -373,6 +373,7 @@ const TOOLS = [
   }, ["path", "content"]),
   t("run_cmd", "Run a shell command in the workspace (git, npm, tests, builds, ls, etc.) and get combined stdout+stderr.", {
     command: { type: "string", description: "The shell command to run" },
+    timeout_ms: { type: "number", description: "Timeout in milliseconds (default 120000, max 600000). Long installs/builds: 300000." },
   }, ["command"]),
   t("github_api", "Call the GitHub REST API to manage the user's account: repos, issues, pull requests, gists, releases, stars, profile. Use paths like '/user/repos'.", {
     method: { type: "string", enum: ["GET", "POST", "PATCH", "PUT", "DELETE"] },
@@ -445,6 +446,7 @@ function runShell(command, cwd, timeoutMs) {
     maxBuffer: 10 * 1024 * 1024,
     env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
   });
+  if (r.error && r.error.killed) return { code: r.status, out: "", error: "timeout" };
   let out = ((r.stdout || "") + (r.stderr || "")).trim();
   if (r.error) out += `\n(process error: ${r.error.message})`;
   return { code: r.status, out: capOut(out, 8000) };
@@ -493,7 +495,10 @@ async function runTool(name, args, ctx) {
         if (!(await allow(`run \`${command}\``, ctx))) {
           return "DENIED by user — do not retry this same command; propose an alternative.";
         }
-        const r = runShell(command, cwd);
+        const maxMs = Math.min(parseInt(process.env.GITMANCER_CMD_TIMEOUT, 10) || 120000, 600000);
+        const tMs = Math.min(Math.max(parseInt(args.timeout_ms, 10) || maxMs, 1000), 600000);
+        const r = runShell(command, cwd, tMs);
+        if (r.error === "timeout") return `ERROR: command timed out after ${tMs}ms — it was killed. Narrow the scope or raise timeout_ms.`;
         return `exit ${r.code}\n${r.out || "(no output)"}`;
       }
 
