@@ -170,7 +170,33 @@ async function gh(cfg, method, endpoint, body) {
   return data;
 }
 
-/* ---------------- AI client (OpenAI-compatible, SSE streaming + fallback) ---------------- */
+/* ---------------- AI client (OpenAI-compatible, SSE streaming + retry + fallback) ---------------- */
+
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function fetchRetry(url, init, label, retries = 2) {
+  let attempt = 0;
+  for (;;) {
+    let res = null;
+    try {
+      res = await fetch(url, init);
+    } catch (e) {
+      if (attempt >= retries) throw new UserErr(`${label} request failed: ${e.message}`);
+    }
+    if (res && !RETRYABLE_STATUS.has(res.status)) return res;
+    if (res && attempt >= retries) return res; // give up — caller surfaces the HTTP error
+    const ra = res ? parseInt(res.headers.get("retry-after") || "", 10) : NaN;
+    const wait = Number.isFinite(ra) && ra > 0 ? Math.min(ra * 1000, 8000) : 400 * 2 ** attempt + Math.floor(Math.random() * 250);
+    if (res && res.body && res.body.resume) {
+      try {
+        res.body.resume();
+      } catch {}
+    }
+    attempt += 1;
+    await sleep(wait);
+  }
+}
 
 function sseAccumulator(onDelta) {
   const state = { content: "", calls: {}, finish: null, streamed: false };
@@ -249,14 +275,8 @@ async function aiChat(cfg, messages, tools, opts = {}) {
   const payload = { model: cfg.aiModel, messages, temperature: 0.2 };
   if (tools && tools.length) payload.tools = tools;
   if (opts.stream) payload.stream = true;
-  const once = async () => {
-    try {
-      return await fetch(url, { method: "POST", headers, body: JSON.stringify(payload) });
-    } catch (e) {
-      throw new UserErr(`AI request failed: ${e.message} (check GITMANCER_AI_BASE: ${cfg.aiBase})`);
-    }
-  };
-  let res = await once();
+  const req = { method: "POST", headers, body: JSON.stringify(payload) };
+  let res = await fetchRetry(url, req, "AI");
   if (opts.stream) {
     const ctype = (res.headers.get("content-type") || "").toLowerCase();
     if (res.ok && ctype.includes("text/event-stream")) {
@@ -264,7 +284,7 @@ async function aiChat(cfg, messages, tools, opts = {}) {
       await acc.consume(res);
       return { message: acc.message, streamed: acc.streamed };
     }
-    if (!res.ok) res = await once(); // provider may not support streaming — retry buffered
+    if (!res.ok) res = await fetchRetry(url, req, "AI", 0); // provider may not support streaming — retry buffered once
   }
   const text = await res.text();
   let json;
