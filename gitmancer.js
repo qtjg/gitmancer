@@ -1169,6 +1169,45 @@ async function cmdStatus(pos, flags) {
   console.log("\n" + rows.join("\n") + "\n");
 }
 
+/* ---------------- sweep: batch overview across all your repos ---------------- */
+
+async function cmdSweep(pos, flags) {
+  const cfg = loadConfig();
+  banner();
+  console.log(dim("listing your repositories…"));
+  const limit = parseInt(flags.limit, 10) || 30;
+  const repos = await gh(cfg, "GET", `/user/repos?per_page=100&sort=pushed`);
+  const mine = (repos || []).slice(0, limit);
+  if (!mine.length) return ok("no repositories found");
+  const results = [];
+  const QUEUE = [...mine];
+  const workers = Array.from({ length: Math.min(5, QUEUE.length) }, async () => {
+    for (;;) {
+      const r = QUEUE.shift();
+      if (!r) break;
+      const row = { repo: r.full_name, language: r.language, stars: r.stargazers_count, pushed: (r.pushed_at || "").slice(0, 10), openIssues: null, openPrs: null };
+      const counts = await Promise.all([
+        gh(cfg, "GET", `/repos/${r.full_name}/issues?state=open&per_page=100`).then((a) => (a || []).filter((i) => !i.pull_request).length).catch(() => null),
+        gh(cfg, "GET", `/repos/${r.full_name}/pulls?state=open&per_page=100`).then((a) => (a || []).length).catch(() => null),
+      ]);
+      row.openIssues = counts[0];
+      row.openPrs = counts[1];
+      results.push(row);
+    }
+  });
+  await Promise.all(workers);
+  results.sort((a, b) => (b.pushed || "").localeCompare(a.pushed || ""));
+  if (flags.json) return console.log(JSON.stringify(results, null, 2));
+  console.log(`\n${bold(results.length + " repos (by last push):")}\n`);
+  for (const r of results) {
+    const lang = r.language ? dim(r.language) : dim("—");
+    const stars = r.stars ? cyan(`★${r.stars}`) : "";
+    const counts = dim(`i:${r.openIssues ?? "?"} pr:${r.openPrs ?? "?"}`);
+    console.log(`  ${bold(r.repo)}  ${lang}  ${stars}  ${counts}  ${dim(r.pushed)}`);
+  }
+  console.log(dim("\nopen counts fetched 5-at-a-time · use --json for scripting\n"));
+}
+
 /* ---------------- help / arg parsing / main ---------------- */
 
 function help() {
@@ -1196,6 +1235,8 @@ ${bold("COMMANDS")}
                     ${dim('--repo owner/name  --json')}
   ${cyan("review")} <pr#>           AI code review of a pull request — severity-tagged findings + verdict
                     ${dim('--repo owner/name  --fast')}
+  ${cyan("sweep")}                 batch overview of ALL your repos — open issues/PRs per repo, 5-at-a-time
+                    ${dim('--limit 30  --json')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -1273,6 +1314,7 @@ async function main() {
     case "pr": return cmdPr(pos, flags);
     case "status": return cmdStatus(pos, flags);
     case "review": return cmdReview(pos, flags);
+    case "sweep": return cmdSweep(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
