@@ -6,7 +6,7 @@ Give it any OpenAI-compatible AI key (Groq / OpenAI / OpenRouter / Z.ai / Ollama
 GitHub token, and it becomes a terminal-native agent that reads and writes your code, runs
 commands, commits, pushes, creates repos, and manages issues — you talk, it ships.
 
-![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![deps](https://img.shields.io/badge/dependencies-0-blue) ![license](https://img.shields.io/badge/license-MIT-orange)
+![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![deps](https://img.shields.io/badge/dependencies-0-blue) ![license](https://img.shields.io/badge/license-MIT-orange) ![version](https://img.shields.io/badge/version-0.2.0-purple)
 
 ```bash
 $ gitmancer ask "add input validation to signup.js and run the tests"
@@ -20,6 +20,14 @@ staged 3 file(s)
 commit: feat(auth): validate signup inputs + rate-limit guard
 ✔ pushed main → origin
 ```
+
+## What's new in v0.2.0 — faster & more effective
+
+- **Streaming output** — answers print token-by-token as the model thinks (SSE), with automatic fallback to buffered mode for providers that don't stream
+- **`gitmancer fix "<cmd>"`** — run any command; if it fails, the agent diagnoses the error, patches the code, and re-verifies until it exits 0
+- **`gitmancer pr`** — opens a pull request with an AI-drafted title & body from your commits and diff
+- **Workspace snapshot** — the system prompt is preloaded with your file tree, `package.json` metadata, README excerpt and git state, so the agent skips exploration steps and burns fewer tokens
+- **`--fast` flag** — one-flag switch to each provider's small model (`groq` → `llama-3.1-8b-instant`, `zai` → `glm-4-flash`, …) for quick tasks
 
 ## Why
 
@@ -71,17 +79,19 @@ never printed (last 4 chars only), and never sent anywhere except their own APIs
 | `gitmancer setup` | one-time wizard for AI key + GitHub token |
 | `gitmancer whoami` | verify your token — see login, repos, followers |
 | `gitmancer repos` | list your repositories with stars / language / last push |
-| `gitmancer ask "<task>"` | **the agent** — explores code, edits files, runs commands, calls GitHub |
+| `gitmancer ask "<task>"` | **the agent** — explores code, edits files, runs commands, calls GitHub (streaming output) |
 | `gitmancer ask --chat` | same, but stays in an interactive conversation |
+| `gitmancer fix "<cmd>"` | run a command; if it fails the agent auto-fixes the code & re-verifies |
+| `gitmancer pr` | open a PR — AI drafts title/body from your commits (`--base main`) |
 | `gitmancer ship ["msg"]` | stage all, AI-generated commit message (if omitted), push |
 | `gitmancer newrepo <name>` | create a GitHub repo via API; `--source .` also init + commit + push |
 | `gitmancer issue <owner/repo> …` | `list` · `create "Title" --body "…"` · `close 12` |
 
-**Useful flags:** `--yolo` (skip confirmations for unattended runs) · `--private` · `--limit N` · `--cwd <dir>`
+**Useful flags:** `--yolo` (skip confirmations for unattended runs) · `--fast` (small model per preset) · `--private` · `--limit N` · `--cwd <dir>`
 
 ### The agent loop
 
-`ask` gives the model five tools and lets it drive:
+`ask` gives the model five tools and lets it drive. Before the first call it also builds a **workspace snapshot** (file tree, package.json metadata, README excerpt, git state) into the system prompt — so it usually knows your project before you finish typing.
 
 - `list_files` / `read_file` — explore your workspace
 - `write_file` — create or rewrite files
@@ -116,7 +126,9 @@ Env-var overrides (CI-friendly): `GITMANCER_AI_KEY`, `GITMANCER_AI_BASE`, `GITMA
 
 ## Roadmap
 
-- [ ] `gitmancer pr` — AI-reviewed pull requests (diff → review comment → merge)
+- [x] `gitmancer pr` — AI-drafted pull requests (v0.2.0)
+- [x] streaming output + `fix` auto-repair + `--fast` mode (v0.2.0)
+- [ ] PR **review** mode: diff → AI review comment posted to the PR
 - [ ] scheduled farming mode: commit queues + planned pushes
 - [ ] repo templates: `newrepo --template node-lib` scaffolds + pushes a full project
 - [ ] multi-repo sweeps: "bump version + changelog + push" across all repos
