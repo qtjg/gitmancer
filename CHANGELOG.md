@@ -19,8 +19,6 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
   now handle >100 repos correctly.
 - `list_files` (agent tool) now respects `.gitignore` patterns (basenames,
   directories, `*.ext` globs, prefix globs) → cleaner prompts, fewer tokens.
-
-### Added
 - `review <pr#>` — AI code review of pull requests with severity-tagged findings
   (`[blocking]` / `[major]` / `[minor]` / `[nit]`) and an APPROVE / REQUEST
   CHANGES / COMMENT verdict. Streams as it reviews.
