@@ -1,5 +1,5 @@
 const http = require("http");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -126,6 +126,14 @@ const server = http.createServer((req, res) => {
       }
       if (reqBody.stream) sseRespond(res, message);
       else respond(res, { choices: [{ message }] });
+    } else if (req.method === "PUT" && req.url.endsWith("/pulls/7/merge")) {
+      respond(res, { merged: true, sha: "abc1234def567890", merge_method: "squash" });
+    } else if (req.method === "PATCH" && req.url.endsWith("/pulls/7")) {
+      respond(res, { number: 7, state: "closed", html_url: "https://github.com/acme/widget/pull/7" });
+    } else if (req.method === "PATCH" && req.url.endsWith("/issues/5")) {
+      respond(res, { number: 5, state: "open", html_url: "https://github.com/acme/widget/issues/5" });
+    } else if (req.url.startsWith("/repos/acme/widget/pulls?")) {
+      respond(res, [{ number: 7, title: "Add widget", user: { login: "mayank-test" }, head: { ref: "feature" }, draft: false, html_url: "https://github.com/acme/widget/pull/7" }]);
     } else if (req.method === "POST" && req.url.endsWith("/pulls")) {
       respond(res, { number: 7, title: "Add widget", html_url: "https://github.com/acme/widget/pull/7" });
     } else if (req.url.endsWith("/pulls/12/diff")) {
@@ -280,6 +288,54 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("doctor exits 0", r.status === 0);
   check("doctor reports GitHub auth", /authenticated as mayank-test/.test(r.stdout || ""));
   check("doctor keeps secrets masked", !((r.stdout || "") + (r.stderr || "")).includes("gh_test_token_abc"));
+
+  console.log("→ pr list / close / merge");
+  r = await runCli(["pr", "list", "--repo", "acme/widget", "--json"], tmp, env);
+  check("pr list exits 0", r.status === 0);
+  j = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {}
+  check("pr list json shows #7", Array.isArray(j) && j[0] && j[0].number === 7);
+  r = await runCli(["pr", "close", "7", "--repo", "acme/widget", "--yolo"], tmp, env);
+  check("pr close exits 0", r.status === 0);
+  check("pr close confirmed", /closed PR #7/.test(r.stdout || ""));
+  r = await runCli(["pr", "merge", "7", "--repo", "acme/widget", "--squash", "--yolo"], tmp, env);
+  check("pr merge exits 0", r.status === 0);
+  check("pr merge confirmed", /merged #7/.test(r.stdout || ""));
+
+  console.log("→ issue reopen");
+  r = await runCli(["issue", "acme/widget", "reopen", "5"], tmp, env);
+  check("issue reopen exits 0", r.status === 0);
+  check("issue reopen confirmed", /reopened #5/.test(r.stdout || ""));
+
+  console.log("→ repos --json / whoami --json");
+  r = await runCli(["repos", "--json"], tmp, env);
+  check("repos --json exits 0", r.status === 0);
+  j = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {}
+  check("repos --json lists acme/widget", Array.isArray(j) && j[0] && j[0].name === "acme/widget");
+  r = await runCli(["whoami", "--json"], tmp, env);
+  check("whoami --json exits 0", r.status === 0);
+  j = null;
+  try {
+    j = JSON.parse(r.stdout);
+  } catch {}
+  check("whoami --json login", !!(j && j.login === "mayank-test"));
+
+  console.log("→ ship --no-push");
+  const shipDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-ship-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: shipDir });
+  spawnSync("git", ["config", "user.email", "t@t.local"], { cwd: shipDir });
+  spawnSync("git", ["config", "user.name", "t"], { cwd: shipDir });
+  fs.writeFileSync(path.join(shipDir, "f.txt"), "x");
+  r = await runCli(["ship", "test: local commit", "--no-push"], shipDir, env);
+  check("ship --no-push exits 0", r.status === 0);
+  check("ship reports no push", /not pushing/.test(r.stdout || ""));
+  const committed = spawnSync("git", ["log", "--oneline", "-1"], { cwd: shipDir, encoding: "utf8" }).stdout || "";
+  check("commit created locally", /test: local commit/.test(committed));
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
