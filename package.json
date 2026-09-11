@@ -1,0 +1,29 @@
+{
+  "name": "gitmancer",
+  "version": "0.1.0",
+  "description": "⚡ Zero-dependency AI CLI agent that codes, commits, pushes, and manages your whole GitHub account — any OpenAI-compatible AI key + a GitHub token.",
+  "main": "gitmancer.js",
+  "bin": {
+    "gitmancer": "gitmancer.js"
+  },
+  "scripts": {
+    "start": "node gitmancer.js --help",
+    "test": "node --check gitmancer.js && node test/mock.e2e.js"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "cli",
+    "github",
+    "openai",
+    "groq",
+    "openrouter",
+    "coding-agent",
+    "automation",
+    "developer-tools"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  }
+}

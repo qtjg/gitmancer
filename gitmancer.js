@@ -1,0 +1,828 @@
+#!/usr/bin/env node
+"use strict";
+/*
+ * gitmancer — zero-dependency AI CLI agent for your code & your whole GitHub account.
+ * Any OpenAI-compatible AI key (Groq/OpenAI/OpenRouter/Z.ai/Ollama/custom) + a GitHub token
+ * = an agent that reads/writes code, runs commands, commits, pushes, creates repos,
+ * manages issues/PRs — straight from your terminal.
+ *
+ * MIT License. https://github.com/gitmancer
+ */
+
+const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const readline = require("readline");
+const { spawnSync } = require("child_process");
+
+const VERSION = "0.1.0";
+const NAME = "gitmancer";
+const UA = `${NAME}/${VERSION}`;
+const CONFIG_DIR = path.join(os.homedir(), ".gitmancer");
+const CONFIG_FILE = path.join(CONFIG_DIR, "config.json");
+const GH_API_DEFAULT = "https://api.github.com";
+const MAX_STEPS = 25;
+
+class UserErr extends Error {}
+
+/* ---------------- output helpers ---------------- */
+
+const TTY = process.stdout.isTTY;
+const paint = (code, s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+const bold = (s) => paint("1", s);
+const dim = (s) => paint("2", s);
+const green = (s) => paint("32", s);
+const yellow = (s) => paint("33", s);
+const red = (s) => paint("31", s);
+const cyan = (s) => paint("36", s);
+const magenta = (s) => paint("35", s);
+
+const ok = (...a) => console.log(green("✔"), ...a);
+const warn = (...a) => console.log(yellow("▲"), ...a);
+const fail = (...a) => console.error(red("✖"), ...a);
+
+function banner() {
+  console.log(magenta(`\n⚡ ${NAME} ${dim("v" + VERSION)} — AI agent for your code & your whole GitHub account\n`));
+}
+
+function capOut(s, n) {
+  s = String(s == null ? "" : s);
+  return s.length > n ? s.slice(0, n) + `\n…(+${s.length - n} chars truncated)` : s;
+}
+
+function mask(s) {
+  return s ? dim("••••••" + s.slice(-4)) : dim("(not set)");
+}
+
+function redact(str, ...secrets) {
+  let out = String(str == null ? "" : str);
+  for (const sec of secrets) {
+    if (sec) out = out.split(sec).join("***");
+  }
+  return out;
+}
+
+/* ---------------- input helpers ---------------- */
+
+let _rl = null;
+let _stdinClosed = false;
+function rl() {
+  if (!_rl) {
+    _rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    _rl.on("SIGINT", () => {
+      console.log(dim("\nbye ⚡"));
+      process.exit(0);
+    });
+    _rl.on("close", () => {
+      _stdinClosed = true;
+    });
+  }
+  return _rl;
+}
+
+function askUser(q) {
+  const r = rl();
+  return new Promise((res) => {
+    if (_stdinClosed) return res(null);
+    const onClose = () => res(null);
+    r.once("close", onClose);
+    r.question(q, (a) => {
+      r.removeListener("close", onClose);
+      res(a);
+    });
+  });
+}
+
+/* ---------------- config ---------------- */
+
+const PRESETS = {
+  groq: { base: "https://api.groq.com/openai/v1", model: "llama-3.3-70b-versatile" },
+  openai: { base: "https://api.openai.com/v1", model: "gpt-4o-mini" },
+  openrouter: { base: "https://openrouter.ai/api/v1", model: "openai/gpt-4o-mini" },
+  zai: { base: "https://api.z.ai/api/paas/v4", model: "glm-4.6" },
+  ollama: { base: "http://127.0.0.1:11434/v1", model: "llama3.1" },
+};
+
+function loadConfig() {
+  let fileCfg = {};
+  try {
+    if (fs.existsSync(CONFIG_FILE)) fileCfg = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+  } catch (e) {
+    warn(`could not parse ${CONFIG_FILE} (${e.message}) — using env/defaults`);
+  }
+  return {
+    aiBase: process.env.GITMANCER_AI_BASE || fileCfg.aiBase || PRESETS.groq.base,
+    aiModel: process.env.GITMANCER_AI_MODEL || fileCfg.aiModel || PRESETS.groq.model,
+    aiKey: process.env.GITMANCER_AI_KEY || fileCfg.aiKey || "",
+    githubToken: process.env.GITMANCER_GITHUB_TOKEN || fileCfg.githubToken || "",
+    ghBase: process.env.GITMANCER_GH_BASE || fileCfg.ghBase || GH_API_DEFAULT,
+  };
+}
+
+function saveConfig(cfg) {
+  fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2) + "\n", { mode: 0o600 });
+  try {
+    fs.chmodSync(CONFIG_FILE, 0o600);
+  } catch {}
+}
+
+/* ---------------- GitHub API client ---------------- */
+
+async function gh(cfg, method, endpoint, body) {
+  if (!cfg.githubToken) {
+    throw new UserErr("No GitHub token. Run `gitmancer setup` or export GITMANCER_GITHUB_TOKEN.");
+  }
+  const url = endpoint.startsWith("http") ? endpoint : cfg.ghBase.replace(/\/$/, "") + endpoint;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: method.toUpperCase(),
+      headers: {
+        Authorization: `Bearer ${cfg.githubToken}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": UA,
+        "Content-Type": "application/json",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+  } catch (e) {
+    throw new UserErr(`GitHub request failed: ${e.message} (check network / GITMANCER_GH_BASE)`);
+  }
+  if (res.status === 204) return null;
+  const text = await res.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = text;
+  }
+  if (!res.ok) {
+    const msg = (data && data.message) || capOut(text, 200);
+    let hint = "";
+    if (res.status === 401) hint = " — token invalid/expired (make a fine-grained PAT)";
+    if (res.status === 403 && res.headers.get("x-ratelimit-remaining") === "0") hint = " — rate limit exhausted, try later";
+    if (res.status === 404) hint = " — not found (check repo name / token scopes)";
+    if (res.status === 422 && data && data.errors) hint = " — " + JSON.stringify(data.errors).slice(0, 200);
+    throw new UserErr(`GitHub ${res.status}: ${msg}${hint}`);
+  }
+  return data;
+}
+
+/* ---------------- AI client (OpenAI-compatible) ---------------- */
+
+async function aiChat(cfg, messages, tools) {
+  const isLocal = /localhost|127\.0\.0\.1/.test(cfg.aiBase);
+  if (!cfg.aiKey && !isLocal) {
+    throw new UserErr("No AI key. Run `gitmancer setup` or export GITMANCER_AI_KEY.");
+  }
+  const body = { model: cfg.aiModel, messages, temperature: 0.2 };
+  if (tools && tools.length) body.tools = tools;
+  let res;
+  try {
+    res = await fetch(cfg.aiBase.replace(/\/$/, "") + "/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(cfg.aiKey ? { Authorization: `Bearer ${cfg.aiKey}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+  } catch (e) {
+    throw new UserErr(`AI request failed: ${e.message} (check GITMANCER_AI_BASE: ${cfg.aiBase})`);
+  }
+  const text = await res.text();
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new UserErr(`AI returned non-JSON (HTTP ${res.status}): ${capOut(text, 300)}`);
+  }
+  if (!res.ok) {
+    const m = (json.error && json.error.message) || capOut(text, 300);
+    throw new UserErr(`AI HTTP ${res.status}: ${m}`);
+  }
+  const choice = json.choices && json.choices[0];
+  if (!choice || !choice.message) throw new UserErr(`AI returned no choices: ${capOut(text, 300)}`);
+  return choice.message;
+}
+
+/* ---------------- agent tools ---------------- */
+
+function t(name, description, properties, required) {
+  return {
+    type: "function",
+    function: { name, description, parameters: { type: "object", properties, required: required || [] } },
+  };
+}
+
+const TOOLS = [
+  t("list_files", "List files and folders under a path in the user's workspace. Always explore before editing.", {
+    path: { type: "string", description: "Relative path from workspace root (default '.')" },
+  }),
+  t("read_file", "Read a text file from the workspace.", {
+    path: { type: "string", description: "Relative file path" },
+  }, ["path"]),
+  t("write_file", "Create or overwrite a file in the workspace with full content.", {
+    path: { type: "string", description: "Relative file path" },
+    content: { type: "string", description: "Complete file content to write" },
+  }, ["path", "content"]),
+  t("run_cmd", "Run a shell command in the workspace (git, npm, tests, builds, ls, etc.) and get combined stdout+stderr.", {
+    command: { type: "string", description: "The shell command to run" },
+  }, ["command"]),
+  t("github_api", "Call the GitHub REST API to manage the user's account: repos, issues, pull requests, gists, releases, stars, profile. Use paths like '/user/repos'.", {
+    method: { type: "string", enum: ["GET", "POST", "PATCH", "PUT", "DELETE"] },
+    endpoint: { type: "string", description: "API path, e.g. /repos/owner/name/issues" },
+    body: { type: "object", description: "JSON request body for POST/PATCH/PUT" },
+  }, ["method", "endpoint"]),
+];
+
+function safePath(cwd, p) {
+  const abs = path.resolve(cwd, p || ".");
+  if (abs !== cwd && !abs.startsWith(cwd + path.sep)) throw new UserErr(`Path escapes workspace: ${p}`);
+  return abs;
+}
+
+const IGNORE_DIRS = new Set(["node_modules", ".git", "dist", "build", "out", "__pycache__", ".next", "venv", ".venv", ".cache"]);
+
+function toolListFiles(cwd, rel) {
+  const root = safePath(cwd, rel || ".");
+  const out = [];
+  const walk = (dir, depth) => {
+    if (depth > 4 || out.length > 400) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      out.push(`(cannot read ${dir}: ${e.message})`);
+      return;
+    }
+    entries.sort((a, b) => (a.isDirectory() === b.isDirectory() ? a.name.localeCompare(b.name) : a.isDirectory() ? -1 : 1));
+    for (const e of entries) {
+      if (out.length > 400) {
+        out.push("…(truncated)");
+        return;
+      }
+      if (e.name.startsWith(".") && e.name !== ".github" && e.name !== ".env.example") continue;
+      if (IGNORE_DIRS.has(e.name)) continue;
+      const rel2 = path.join(path.relative(cwd, dir), e.name);
+      if (e.isDirectory()) {
+        out.push(rel2 + "/");
+        walk(path.join(dir, e.name), depth + 1);
+      } else if (e.isFile()) {
+        let size = "";
+        try {
+          size = ` (${fs.statSync(path.join(dir, e.name)).size}b)`;
+        } catch {}
+        out.push(rel2 + size);
+      }
+    }
+  };
+  walk(root, 0);
+  return out.length ? out.join("\n") : "(empty directory)";
+}
+
+const SAFE_CMD_RE = /^\s*(ls|pwd|cat|head|tail|wc|file|which|git status|git log\b|git diff|git branch|git remote|git show|node --version|npm --version|npx tsc --version|python3? --version|echo\s)/;
+
+function shortArgs(args) {
+  try {
+    return capOut(JSON.stringify(args), 140);
+  } catch {
+    return "(args)";
+  }
+}
+
+function runShell(command, cwd, timeoutMs) {
+  const r = spawnSync(command, {
+    shell: true,
+    cwd,
+    encoding: "utf8",
+    timeout: timeoutMs || 120000,
+    maxBuffer: 10 * 1024 * 1024,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+  });
+  let out = ((r.stdout || "") + (r.stderr || "")).trim();
+  if (r.error) out += `\n(process error: ${r.error.message})`;
+  return { code: r.status, out: capOut(out, 8000) };
+}
+
+async function allow(desc, ctx) {
+  if (ctx.yolo || ctx.always.value) return true;
+  if (SAFE_CMD_RE.test(desc)) {
+    console.log(dim(`  ⚙ ${desc}`));
+    return true;
+  }
+  const ans = ((await askUser(`${yellow("allow")} ${bold(desc)} ${dim("[y/N/a]")} `)) ?? "").trim().toLowerCase();
+  if (ans === "a" || ans === "always") {
+    ctx.always.value = true;
+    return true;
+  }
+  return ans === "y" || ans === "yes";
+}
+
+async function runTool(name, args, ctx) {
+  const cwd = ctx.cwd;
+  try {
+    switch (name) {
+      case "list_files":
+        return toolListFiles(cwd, args.path || ".");
+
+      case "read_file": {
+        const abs = safePath(cwd, args.path);
+        return capOut(fs.readFileSync(abs, "utf8"), 20000);
+      }
+
+      case "write_file": {
+        const abs = safePath(cwd, args.path);
+        const rel = path.relative(cwd, abs);
+        if (!(await allow(`write ${rel} (${Buffer.byteLength(String(args.content || ""))} bytes)`, ctx))) {
+          return "DENIED by user — do not retry this same write; propose an alternative.";
+        }
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, String(args.content == null ? "" : args.content));
+        return `OK — wrote ${rel} (${fs.statSync(abs).size} bytes)`;
+      }
+
+      case "run_cmd": {
+        const command = String(args.command || "").trim();
+        if (!command) return "ERROR: empty command";
+        if (!(await allow(`run \`${command}\``, ctx))) {
+          return "DENIED by user — do not retry this same command; propose an alternative.";
+        }
+        const r = runShell(command, cwd);
+        return `exit ${r.code}\n${r.out || "(no output)"}`;
+      }
+
+      case "github_api": {
+        const method = String(args.method || "GET").toUpperCase();
+        const endpoint = String(args.endpoint || "");
+        if (!endpoint) return "ERROR: missing endpoint";
+        const desc = `GITHUB ${method} ${endpoint}`;
+        if (method !== "GET" && !(await allow(desc, ctx))) {
+          return "DENIED by user — do not retry this same call; propose an alternative.";
+        }
+        const data = await gh(ctx.cfg, method, endpoint, args.body);
+        return capOut(typeof data === "string" ? data : JSON.stringify(data, null, 2), 6000);
+      }
+
+      default:
+        return `ERROR: unknown tool "${name}"`;
+    }
+  } catch (e) {
+    return `ERROR: ${e.message}`;
+  }
+}
+
+/* ---------------- agent loop ---------------- */
+
+function systemPrompt(ctx) {
+  return [
+    `You are ${NAME} v${VERSION}, an autonomous coding and GitHub agent running in the user's terminal.`,
+    `Workspace (cwd): ${ctx.cwd}`,
+    `OS: ${os.platform()} ${os.arch()} | Node ${process.version} | Date: ${new Date().toISOString().slice(0, 10)}`,
+    "",
+    "Rules:",
+    "- Inspect before you edit: list_files / read_file first, then make minimal, correct changes.",
+    "- Use run_cmd for git operations (status, diff, add, commit, push) when the user asks to commit or push.",
+    "- Use github_api for account-level actions: repos, issues, pull requests, gists, releases, stars.",
+    "- Mutating tools prompt the user for approval unless they enabled yolo mode.",
+    "- If something fails, read the error and try a reasonable fix; never repeat the exact same failing call more than twice.",
+    "- When the task is complete, reply with a SHORT summary of what changed and a suggested next step.",
+    "- Never print, log, or write the user's tokens or API keys anywhere. Never put tokens in file content or commands.",
+  ].join("\n");
+}
+
+function trimHistory(messages) {
+  if (messages.length <= 80) return;
+  const keep = 60;
+  messages.splice(1, messages.length - 1 - keep);
+}
+
+async function agentTurn(cfg, messages, ctx) {
+  for (let step = 0; step < MAX_STEPS; step++) {
+    let msg;
+    try {
+      msg = await aiChat(cfg, messages, TOOLS);
+    } catch (e) {
+      fail(e.message);
+      return "error";
+    }
+    const calls = msg.tool_calls || [];
+    if (!calls.length) {
+      console.log((msg.content || dim("(no answer)")) + "\n");
+      messages.push({ role: "assistant", content: msg.content || "" });
+      return "done";
+    }
+    messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
+    for (const tc of calls) {
+      const name = tc.function && tc.function.name;
+      let args = {};
+      try {
+        args = JSON.parse((tc.function && tc.function.arguments) || "{}");
+      } catch {}
+      console.log(cyan(`\n⚙ ${name}`) + dim(` ${shortArgs(args)}`));
+      const result = await runTool(name, args, ctx);
+      console.log(
+        dim(
+          capOut(result, 500)
+            .split("\n")
+            .map((l) => "  │ " + l)
+            .join("\n")
+        )
+      );
+      messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+    }
+    trimHistory(messages);
+  }
+  warn(`stopped after ${MAX_STEPS} steps — continue with a follow-up message if needed`);
+  return "max_steps";
+}
+
+/* ---------------- commands ---------------- */
+
+async function cmdSetup(flags) {
+  banner();
+  const existing = loadConfig();
+  const presetName = String(flags.preset || flags[1] || "groq").toLowerCase();
+  const preset = PRESETS[presetName];
+  if (!preset && presetName !== "custom") {
+    throw new UserErr(`Unknown preset "${presetName}". Options: ${Object.keys(PRESETS).join(" | ")}, custom`);
+  }
+  console.log(`provider: ${bold(presetName)}${preset ? dim(`  (${preset.base})`) : dim("  (custom endpoint)")}\n`);
+  const base = flags.base || (preset ? preset.base : (await askUser("API base URL: ")));
+  let model = flags.model || (preset ? preset.model : "");
+  if (!model) model = await askUser("Default model: ");
+  let aiKey = flags.key || "";
+  if (!aiKey) {
+    aiKey = ((await askUser(`AI API key ${existing.aiKey ? dim("(enter to keep ••••" + existing.aiKey.slice(-4) + ")") : ""}: `)) ?? "").trim() || existing.aiKey;
+  }
+  let ghToken = flags.token || "";
+  if (!ghToken) {
+    ghToken =
+      ((await askUser(`GitHub token ${existing.githubToken ? dim("(enter to keep ••••" + existing.githubToken.slice(-4) + ")") : dim("(optional, for account features)")}: `)) ?? "").trim() ||
+      existing.githubToken;
+  }
+  const cfg = {
+    preset: presetName,
+    aiBase: base,
+    aiModel: model,
+    aiKey,
+    githubToken: ghToken,
+    ghBase: flags.ghBase || existing.ghBase || GH_API_DEFAULT,
+  };
+  saveConfig(cfg);
+  ok(`saved ${dim(CONFIG_FILE)} (chmod 600)`);
+  console.log(`\nnext steps:
+  ${cyan(`${NAME} whoami`)}                     ${dim("— verify your GitHub token")}
+  ${cyan(`${NAME} ask "explain this repo"`)}    ${dim("— let the agent explore your code")}
+  ${cyan(`${NAME} ship`)}                       ${dim("— AI commit message + push")}
+  ${cyan(`${NAME} newrepo my-app --source .`)}  ${dim("— create repo & push a folder in one shot")}\n`);
+}
+
+function cmdConfig() {
+  const cfg = loadConfig();
+  banner();
+  console.log(`config file : ${dim(CONFIG_FILE)} ${fs.existsSync(CONFIG_FILE) ? dim("(exists)") : dim("(missing — run setup)")}
+ai provider  : ${bold(cfg.aiBase)}
+ai model     : ${bold(cfg.aiModel)}
+ai key       : ${mask(cfg.aiKey)}
+github token : ${mask(cfg.githubToken)}
+github api   : ${dim(cfg.ghBase)}
+`);
+}
+
+async function cmdWhoami() {
+  const cfg = loadConfig();
+  const u = await gh(cfg, "GET", "/user");
+  console.log(`\n  ${bold("login     ")} ${cyan(u.login)}
+  ${bold("name      ")} ${u.name || dim("—")}
+  ${bold("repos     ")} ${u.public_repos} public${u.total_private_repos ? `, ${u.total_private_repos} private` : ""}
+  ${bold("followers ")} ${u.followers}
+  ${bold("url       ")} ${u.html_url}\n`);
+}
+
+async function cmdRepos(flags) {
+  const cfg = loadConfig();
+  const limit = parseInt(flags.limit, 10) || 50;
+  const all = [];
+  for (let page = 1; all.length < limit; page++) {
+    const chunk = await gh(cfg, "GET", `/user/repos?per_page=100&page=${page}&sort=updated`);
+    if (!chunk || !chunk.length) break;
+    all.push(...chunk);
+    if (chunk.length < 100) break;
+  }
+  if (!all.length) return ok("no repositories found");
+  console.log(`\n${bold(all.length + " repos (most recently updated):")}\n`);
+  for (const r of all.slice(0, limit)) {
+    const vis = r.private ? yellow("[private]") : dim("[public]");
+    const lang = r.language ? dim(r.language) : dim("—");
+    const stars = r.stargazers_count ? `★${r.stargazers_count}` : "";
+    const pushed = (r.pushed_at || "").slice(0, 10);
+    console.log(`  ${bold(r.full_name)} ${vis} ${lang} ${stars ? cyan(stars) : ""} ${dim(pushed)}`);
+  }
+  console.log("");
+}
+
+async function cmdAsk(pos, flags) {
+  const cfg = loadConfig();
+  const ctx = {
+    cwd: path.resolve(flags.cwd || process.cwd()),
+    yolo: !!flags.yolo,
+    always: { value: false },
+    cfg,
+  };
+  const sys = systemPrompt(ctx);
+  const messages = [{ role: "system", content: sys }];
+  banner();
+  const task = pos.join(" ").trim();
+  if (task) {
+    messages.push({ role: "user", content: task });
+    await agentTurn(cfg, messages, ctx);
+    if (!flags.chat) return;
+  }
+  console.log(dim("interactive mode — /yolo toggles auto-approve, /clear resets, /exit quits\n"));
+  for (;;) {
+    let line;
+    try {
+      line = await askUser(cyan("you › "));
+    } catch {
+      break;
+    }
+    if (line == null) break;
+    const t2 = line.trim();
+    if (/^\/(exit|quit)$/i.test(t2)) break;
+    if (!t2) continue;
+    if (/^\/yolo$/i.test(t2)) {
+      ctx.yolo = !ctx.yolo;
+      ok(`yolo ${ctx.yolo ? "ON — no more confirmations" : "OFF — confirming mutations"}`);
+      continue;
+    }
+    if (/^\/clear$/i.test(t2)) {
+      messages.length = 0;
+      messages.push({ role: "system", content: sys });
+      ok("context cleared");
+      continue;
+    }
+    messages.push({ role: "user", content: t2 });
+    trimHistory(messages);
+    await agentTurn(cfg, messages, ctx);
+  }
+  console.log(dim("\nbye ⚡"));
+}
+
+/* ---------------- git plumbing ---------------- */
+
+function gitOut(args, cwd, ...redactSecrets) {
+  const r = spawnSync("git", args, { cwd, encoding: "utf8", maxBuffer: 10 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } });
+  if (r.status !== 0) {
+    throw new UserErr(`git ${args.join(" ")} failed:\n${redact((r.stderr || r.stdout || "(no output)").trim(), ...redactSecrets)}`);
+  }
+  return (r.stdout || "").trim();
+}
+
+function gitRoot(dir) {
+  try {
+    return gitOut(["rev-parse", "--show-toplevel"], dir);
+  } catch {
+    return null;
+  }
+}
+
+async function aiCommitMessage(cfg, root) {
+  const stat = gitOut(["diff", "--cached", "--stat"], root);
+  let recent = "";
+  try {
+    recent = gitOut(["log", "--oneline", "-5"], root);
+  } catch {}
+  try {
+    const ai = await aiChat(cfg, [
+      {
+        role: "system",
+        content:
+          "You write git commit messages. Reply with ONE line only: conventional-commit style (feat|fix|chore|docs|refactor|test|style: summary). No quotes, no backticks, max 72 characters.",
+      },
+      { role: "user", content: `Staged changes:\n${capOut(stat, 1500)}\n\nRecent commits:\n${recent || "(none)"}` },
+    ]);
+    return String(ai.content || "")
+      .split("\n")[0]
+      .replace(/[`"']/g, "")
+      .trim()
+      .slice(0, 72);
+  } catch (e) {
+    warn(`AI commit message failed (${e.message}) — using fallback`);
+    return "";
+  }
+}
+
+async function cmdShip(pos, flags) {
+  const cfg = loadConfig();
+  const root = gitRoot(process.cwd());
+  if (!root) throw new UserErr("Not inside a git repository (cd into your project first).");
+  banner();
+  gitOut(["add", "-A"], root);
+  const st = gitOut(["status", "--porcelain"], root);
+  if (!st) return ok("nothing to commit — working tree clean");
+  const files = st.split("\n").length;
+  console.log(dim(`staged ${files} file(s)`));
+  let msg = pos.join(" ").trim();
+  if (!msg) {
+    console.log(dim("generating commit message with AI…"));
+    msg = (await aiCommitMessage(cfg, root)) || `chore: update ${new Date().toISOString().slice(0, 10)}`;
+  }
+  console.log(`commit: ${bold(msg)}`);
+  gitOut(["commit", "-m", msg], root);
+  const branch = gitOut(["rev-parse", "--abbrev-ref", "HEAD"], root);
+  try {
+    gitOut(["push", "-u", "origin", branch], root);
+    ok(`pushed ${cyan(branch)} → origin`);
+  } catch (e) {
+    fail(e.message);
+    info(dim("commit saved locally — push manually once your git credentials work, or check your token."));
+  }
+  console.log("");
+}
+
+async function cmdNewRepo(pos, flags) {
+  const cfg = loadConfig();
+  const name = pos[0];
+  if (!name) throw new UserErr('usage: gitmancer newrepo <name> [--private] [--source <dir>] [--desc "..."] [--m "commit message"]');
+  banner();
+  const priv = !!flags.private;
+  console.log(dim(`creating ${priv ? "private" : "public"} repo ${name} via GitHub API…`));
+  const repo = await gh(cfg, "POST", "/user/repos", {
+    name,
+    private: priv,
+    description: flags.desc || "",
+    auto_init: false,
+  });
+  const login = repo.owner.login;
+  ok(`created ${bold(`${login}/${name}`)} → ${repo.html_url}`);
+  const src = flags.source ? path.resolve(flags.source) : null;
+  if (src) {
+    if (!fs.existsSync(src)) throw new UserErr(`source dir not found: ${src}`);
+    console.log(dim(`pushing ${src} …`));
+    if (!fs.existsSync(path.join(src, ".git"))) gitOut(["init", "-b", "main"], src);
+    gitOut(["add", "-A"], src);
+    if (gitOut(["status", "--porcelain"], src)) {
+      gitOut(["commit", "-m", flags.m || "Initial commit via gitmancer ⚡"], src);
+    }
+    try {
+      gitOut(["remote", "remove", "origin"], src);
+    } catch {}
+    gitOut(["remote", "add", "origin", `https://github.com/${login}/${name}.git`], src);
+    let branch = "main";
+    try {
+      branch = gitOut(["rev-parse", "--abbrev-ref", "HEAD"], src) || "main";
+    } catch {}
+    const pushUrl = `https://x-access-token:${cfg.githubToken}@github.com/${login}/${name}.git`;
+    const r = spawnSync("git", ["push", pushUrl, branch], {
+      cwd: src,
+      encoding: "utf8",
+      maxBuffer: 10 * 1024 * 1024,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    });
+    const out = redact((r.stdout || "") + (r.stderr || ""), cfg.githubToken);
+    if (r.status !== 0) {
+      fail(`push failed:\n${out.trim()}`);
+      info(dim(`repo is created — push manually: cd ${src} && git push -u origin ${branch}`));
+    } else {
+      ok(`pushed ${cyan(branch)} → ${bold(`${login}/${name}`)}`);
+      console.log(dim(out.trim()));
+    }
+  }
+  console.log("");
+}
+
+async function cmdIssue(pos, flags) {
+  const cfg = loadConfig();
+  const repo = pos[0];
+  const action = (pos[1] || "list").toLowerCase();
+  if (!repo || !repo.includes("/")) throw new UserErr('usage: gitmancer issue <owner/repo> list | create "Title" [--body "..."] | close <number>');
+  banner();
+  if (action === "list") {
+    const items = await gh(cfg, "GET", `/repos/${repo}/issues?state=${flags.state || "open"}&per_page=${flags.limit || 20}`);
+    const issues = (items || []).filter((i) => !i.pull_request);
+    if (!issues.length) return ok(`no ${flags.state || "open"} issues on ${repo}`);
+    for (const i of issues) {
+      const labels = (i.labels || []).map((l) => l.name).join(",");
+      console.log(`  ${cyan("#" + i.number)} ${bold(i.title)} ${dim(i.user && i.user.login || "")} ${labels ? magenta("[" + labels + "]") : ""}`);
+    }
+    console.log("");
+  } else if (action === "create") {
+    const title = pos.slice(2).join(" ") || flags.title;
+    if (!title) throw new UserErr('give a title: gitmancer issue owner/repo create "Something is broken"');
+    const it = await gh(cfg, "POST", `/repos/${repo}/issues`, { title, body: flags.body || "" });
+    ok(`created ${cyan("#" + it.number)} ${it.title} → ${it.html_url}`);
+  } else if (action === "close") {
+    const n = parseInt(pos[2], 10);
+    if (!n) throw new UserErr("usage: gitmancer issue owner/repo close 12");
+    await gh(cfg, "PATCH", `/repos/${repo}/issues/${n}`, { state: "closed" });
+    ok(`closed #${n}`);
+  } else {
+    throw new UserErr(`unknown action "${action}" — try list | create | close`);
+  }
+}
+
+/* ---------------- help / arg parsing / main ---------------- */
+
+function help() {
+  banner();
+  console.log(`${bold("USAGE")}
+  gitmancer <command> [args] [flags]
+
+${bold("COMMANDS")}
+  ${cyan("setup")}                  store AI key + GitHub token locally (~/.gitmancer/config.json)
+                    ${dim("--preset groq|openai|openrouter|zai|ollama|custom  --key  --token  --model  --base")}
+  ${cyan("config")}                 show current config (secrets masked)
+  ${cyan("whoami")}                 verify GitHub token — who are you on GitHub?
+  ${cyan("repos")}                  list your repositories           ${dim("--limit 50")}
+  ${cyan("ask")} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
+                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --cwd <dir>')}
+  ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
+  ${cyan("newrepo")} <name>         create GitHub repo + optionally push a folder in one shot
+                    ${dim("--private  --source <dir>  --desc \"…\"  --m \"initial commit msg\"")}
+  ${cyan("issue")} <owner/repo> …   list | create "Title" [--body "…"] | close <number>
+  ${cyan("help")} / ${cyan("version")}
+
+${bold("PROVIDERS")}
+  any OpenAI-compatible API works — set once in setup:
+    groq (free) · openai · openrouter · zai · ollama (local) · custom base URL
+
+${bold("SAFETY")}
+  tokens live only in ~/.gitmancer/config.json (chmod 600) — never uploaded, never logged.
+  writes / commands / GitHub mutations ask before acting, unless --yolo.
+
+${bold("EXAMPLES")}
+  gitmancer ask "what does this repo do? then fix the typo in README"
+  gitmancer ask --yolo "add tests for utils.js and run them"
+  gitmancer ship
+  gitmancer newrepo my-side-project --private --source ./my-side-project
+  gitmancer issue me/myrepo create "Bug: login fails on Safari"
+`);
+}
+
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force"]);
+
+function parseArgs(argv) {
+  let cmd = null;
+  const pos = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--") {
+      pos.push(...argv.slice(i + 1));
+      break;
+    }
+    if (/^--/.test(a) || (/^-/.test(a) && a.length > 1 && !/^-[0-9]/.test(a))) {
+      const key = a.replace(/^--?/, "");
+      const eq = key.indexOf("=");
+      if (eq !== -1) {
+        flags[key.slice(0, eq)] = key.slice(eq + 1);
+        continue;
+      }
+      const next = argv[i + 1];
+      if (BOOLEAN_FLAGS.has(key) || next === undefined || /^-/.test(next)) {
+        flags[key] = true;
+      } else {
+        flags[key] = next;
+        i++;
+      }
+      continue;
+    }
+    if (cmd === null) cmd = a;
+    else pos.push(a);
+  }
+  return { cmd, pos, flags };
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const { cmd, pos, flags } = parseArgs(argv);
+  if (flags.version || flags.v) return console.log(`${NAME} v${VERSION}`);
+  if (flags.help || flags.h) return help();
+  if (!cmd || cmd === "help") return help();
+  switch (cmd) {
+    case "help": return help();
+    case "version": return console.log(`${NAME} v${VERSION}`);
+    case "setup": return cmdSetup(flags);
+    case "config": return cmdConfig();
+    case "whoami": return cmdWhoami();
+    case "repos": return cmdRepos(flags);
+    case "ask":
+    case "agent": return cmdAsk(pos, flags);
+    case "ship": return cmdShip(pos, flags);
+    case "newrepo": return cmdNewRepo(pos, flags);
+    case "issue": return cmdIssue(pos, flags);
+    default:
+      // shorthand: gitmancer "do a thing" → ask
+      return cmdAsk([cmd, ...pos], flags);
+  }
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch((e) => {
+    fail(e instanceof UserErr ? e.message : (e && e.stack) || String(e));
+    process.exit(1);
+  });
