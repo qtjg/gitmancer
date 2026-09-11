@@ -102,9 +102,10 @@ never printed (last 4 chars only), and never sent anywhere except their own APIs
 | `gitmancer ask --chat` | same, but stays in an interactive conversation |
 | `gitmancer fix "<cmd>"` | run a command; if it fails the agent auto-fixes the code & re-verifies |
 | `gitmancer pr` | open a PR — AI drafts title/body from your commits (`--base main`) |
-| `gitmancer ship ["msg"]` | stage all, AI-generated commit message (if omitted), push |
-| `gitmancer newrepo <name>` | create a GitHub repo via API; `--source .` also init + commit + push |
-| `gitmancer issue <owner/repo> …` | `list` · `create "Title" --body "…"` · `close 12` |
+| `gitmancer pr list/close/merge` | full PR lifecycle: list (`--state all`, `--json`), confirm-gated close, merge (`--squash`) |
+| `gitmancer ship ["msg"]` | stage all, AI-generated commit message (if omitted), push (`--no-push` to stay local) |
+| `gitmancer newrepo <name>` | create a GitHub repo via API; `--source .` also init + commit + push; `--template node-lib` scaffolds a zero-dep library |
+| `gitmancer issue <owner/repo> …` | `list` · `create "Title" --body "…"` · `close 12` · `reopen 12` |
 | `gitmancer review <pr#>` | AI code review of a PR — findings + verdict (`--repo owner/name`) |
 | `gitmancer status` | dashboard: branch, dirty files, sync state, open issues/PRs, CI (`--json`) |
 | `gitmancer sweep` | batch overview of all your repos — open counts per repo (`--json`) |
