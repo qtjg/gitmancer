@@ -778,9 +778,12 @@ github api   : ${dim(cfg.ghBase)}
 `);
 }
 
-async function cmdWhoami() {
+async function cmdWhoami(flags) {
   const cfg = loadConfig();
   const u = await gh(cfg, "GET", "/user");
+  if (flags && flags.json) {
+    return console.log(JSON.stringify({ login: u.login, name: u.name, id: u.id, publicRepos: u.public_repos, privateRepos: u.total_private_repos, followers: u.followers, url: u.html_url }, null, 2));
+  }
   console.log(`\n  ${bold("login     ")} ${cyan(u.login)}
   ${bold("name      ")} ${u.name || dim("—")}
   ${bold("repos     ")} ${u.public_repos} public${u.total_private_repos ? `, ${u.total_private_repos} private` : ""}
@@ -1426,7 +1429,7 @@ ${bold("COMMANDS")}
   ${cyan("setup")}                  store AI key + GitHub token locally (~/.gitmancer/config.json)
                     ${dim("--preset groq|openai|openrouter|zai|ollama|custom  --key  --token  --model  --base")}
   ${cyan("config")}                 show current config (secrets masked)
-  ${cyan("whoami")}                 verify GitHub token — who are you on GitHub?
+  ${cyan("whoami")}                 verify GitHub token — who are you on GitHub? ${dim("--json")}
   ${cyan("repos")}                  list your repositories           ${dim('--limit 50  --json')}
   ${cyan('ask')} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
                     ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>')}
@@ -1516,7 +1519,7 @@ async function main() {
     case "version": return console.log(`${NAME} v${VERSION}`);
     case "setup": return cmdSetup(flags);
     case "config": return cmdConfig();
-    case "whoami": return cmdWhoami();
+    case "whoami": return cmdWhoami(flags);
     case "repos": return cmdRepos(flags);
     case "ask":
     case "agent": return cmdAsk(pos, flags);
