@@ -1208,6 +1208,57 @@ async function cmdSweep(pos, flags) {
   console.log(dim("\nopen counts fetched 5-at-a-time · use --json for scripting\n"));
 }
 
+/* ---------------- doctor: config & connectivity diagnostics ---------------- */
+
+async function cmdDoctor() {
+  const cfg = loadConfig();
+  banner();
+  let critical = 0;
+  const line = (pass, label, detail) => console.log(`  ${pass ? green("✔") : yellow("▲")} ${label.padEnd(18)} ${dim(detail)}`);
+  const bad = (label, detail) => {
+    console.log(`  ${red("✖")} ${label.padEnd(18)} ${dim(detail)}`);
+    critical += 1;
+  };
+  console.log("");
+  const maj = Number(process.versions.node.split(".")[0]);
+  if (maj >= 18) line(true, "node", process.version + " (fetch available)");
+  else bad("node", `${process.version} — Node 18+ required for built-in fetch`);
+  const exists = fs.existsSync(CONFIG_FILE);
+  if (exists) line(true, "config file", CONFIG_FILE);
+  else line(false, "config file", CONFIG_FILE + " missing — run `gitmancer setup`");
+  if (cfg.aiKey) line(true, "AI key", mask(cfg.aiKey));
+  else bad("AI key", "not set — run `gitmancer setup` or export GITMANCER_AI_KEY");
+  if (cfg.aiFallbacks && cfg.aiFallbacks.length) {
+    const okShape = cfg.aiFallbacks.every((f) => f && f.base && f.model);
+    if (okShape) line(true, "AI fallbacks", cfg.aiFallbacks.map((f) => f.model).join(" → "));
+    else bad("AI fallbacks", "invalid shape — each needs { base, model, key? }");
+  } else line(true, "AI fallbacks", "none configured (optional)");
+  if (cfg.githubToken) line(true, "GitHub token", mask(cfg.githubToken));
+  else bad("GitHub token", "not set — account features disabled until you run `gitmancer setup`");
+  try {
+    const u = await gh(cfg, "GET", "/user");
+    line(true, "GitHub API", `${cfg.ghBase} — authenticated as ${u.login}`);
+  } catch (e) {
+    bad("GitHub API", String(e.message).slice(0, 120));
+  }
+  try {
+    const isLocal = /localhost|127\.0\.0\.1/.test(cfg.aiBase);
+    if (!cfg.aiKey && !isLocal) throw new UserErr("no key — skipping value only");
+    const res = await fetch(cfg.aiBase.replace(/\/$/, "") + "/models", {
+      headers: cfg.aiKey ? { Authorization: `Bearer ${cfg.aiKey}` } : {},
+    });
+    line(res.ok, "AI endpoint", `${cfg.aiBase} — HTTP ${res.status}${res.ok ? "" : " (some providers 401 /models; chat may still work)"}`);
+  } catch (e) {
+    bad("AI endpoint", `${cfg.aiBase} — ${String(e.message).slice(0, 100)}`);
+  }
+  console.log(dim(`\n  cache: ${_ghCache.size} entr${_ghCache.size === 1 ? "y" : "ies"} · MAX_STEPS=${MAX_STEPS} · version ${VERSION}\n`));
+  if (critical) {
+    fail(`${critical} critical issue(s) — fix the ✖ lines above`);
+    process.exitCode = 1;
+  } else ok("all critical checks passed ⚡");
+  console.log("");
+}
+
 /* ---------------- help / arg parsing / main ---------------- */
 
 function help() {
@@ -1237,6 +1288,7 @@ ${bold("COMMANDS")}
                     ${dim('--repo owner/name  --fast')}
   ${cyan("sweep")}                 batch overview of ALL your repos — open issues/PRs per repo, 5-at-a-time
                     ${dim('--limit 30  --json')}
+  ${cyan("doctor")}                 diagnose setup: keys, tokens, endpoints, fallbacks — tells you what to fix
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -1315,6 +1367,7 @@ async function main() {
     case "status": return cmdStatus(pos, flags);
     case "review": return cmdReview(pos, flags);
     case "sweep": return cmdSweep(pos, flags);
+    case "doctor": return cmdDoctor();
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
