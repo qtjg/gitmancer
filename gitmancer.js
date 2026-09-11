@@ -1465,11 +1465,17 @@ ${bold("SAFETY")}
 
 ${bold("EXAMPLES")}
   gitmancer ask "what does this repo do? then fix the typo in README"
-  gitmancer ask --yolo "add tests for utils.js and run them"
+  gitmancer ask --yolo --steps 50 "add tests for utils.js and run them"
   gitmancer fix "npm test"                ${dim("# tests failing? the agent repairs code & re-verifies")}
   gitmancer pr --base main                ${dim("# AI-drafted PR from your current branch")}
-  gitmancer ship
-  gitmancer newrepo my-side-project --private --source ./my-side-project
+  gitmancer pr list --state all --json    ${dim("# full PR inventory for scripts")}
+  gitmancer pr merge 12 --squash          ${dim("# confirm-gated merge")}
+  gitmancer review 12                     ${dim("# AI code review: findings + verdict")}
+  gitmancer status                        ${dim("# branch, sync, issues/PRs, CI — one shot")}
+  gitmancer sweep --json | jq '.[].repo'  ${dim("# all repos, scriptable")}
+  gitmancer doctor                        ${dim("# is my setup broken? what exactly?")}
+  gitmancer ship --no-push                ${dim("# AI commit message, stay local")}
+  gitmancer newrepo my-lib --template node-lib --source ./my-lib
   gitmancer issue me/myrepo create "Bug: login fails on Safari"
 `);
 }
