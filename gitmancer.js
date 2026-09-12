@@ -15,7 +15,7 @@ const path = require("path");
 const readline = require("readline");
 const { spawnSync } = require("child_process");
 
-const VERSION = "0.4.0";
+const VERSION = "0.5.0";
 const NAME = "gitmancer";
 const UA = `${NAME}/${VERSION}`;
 const CONFIG_DIR = path.join(os.homedir(), ".gitmancer");
@@ -41,6 +41,7 @@ const magenta = (s) => paint("35", s);
 const ok = (...a) => console.log(green("✔"), ...a);
 const warn = (...a) => console.log(yellow("▲"), ...a);
 const fail = (...a) => console.error(red("✖"), ...a);
+const info = (...a) => console.log(cyan("ℹ"), ...a);
 
 function banner() {
   console.log(magenta(`\n⚡ ${NAME} ${dim("v" + VERSION)} — AI agent for your code & your whole GitHub account\n`));
@@ -977,9 +978,15 @@ async function cmdAsk(pos, flags) {
   banner();
   const task = pos.join(" ").trim();
   if (task) {
-    messages.push({ role: "user", content: task });
-    await agentTurn(cfg, messages, ctx);
-    if (!flags.chat) return;
+    const prompted = flags.verify
+      ? task + "\n\n(Cite every file you mention as path/file.ext:LINE so the receipts can be mechanically verified.)"
+      : task;
+    messages.push({ role: "user", content: prompted });
+    const how = await agentTurn(cfg, messages, ctx);
+    if (!flags.chat) {
+      if (flags.verify && how === "done") await verifyReceipts(messages, ctx.cwd);
+      return;
+    }
   }
   console.log(dim("interactive mode — /yolo toggles auto-approve, /clear resets, /exit quits\n"));
   for (;;) {
@@ -1580,6 +1587,154 @@ async function cmdPrMerge(pos, flags, cfg) {
   console.log("");
 }
 
+/* ---------------- changelog + release: AI release notes ---------------- */
+
+function lastTag(root) {
+  try {
+    return gitOut(["describe", "--tags", "--abbrev=0"], root);
+  } catch {
+    return null;
+  }
+}
+
+function rangeCommits(root, from, to) {
+  const raw = gitOut(["log", "--pretty=format:%h%x09%s%x09%an%x09%ad", "--date=short", `${from}..${to}`], root);
+  return raw
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => {
+      const [hash, subject, author, date] = l.split("\t");
+      return { hash, subject, author, date };
+    });
+}
+
+async function aiReleaseNotes(cfg, commits, version) {
+  const list = commits.map((c) => `- ${c.hash} ${c.subject} (${c.author})`).join("\n");
+  const { message } = await aiChat(cfg, [
+    {
+      role: "system",
+      content:
+        "You write release notes in Keep-a-Changelog style markdown. Given a list of git commits, output concise markdown with sections Added / Changed / Fixed / Removed (omit empty ones), one bullet per meaningful change, mentioning short hashes. No preamble, no code fences.",
+    },
+    { role: "user", content: (version ? `Release version: ${version}\n\n` : "") + `Commits:\n${capOut(list, 6000)}` },
+  ]);
+  const md = String((message && message.content) || "")
+    .replace(/```[a-z]*\n?/g, "")
+    .trim();
+  if (!md) throw new UserErr("AI returned empty release notes — check your AI key/model");
+  return md;
+}
+
+function changelogHeading(title) {
+  return `## ${title} — ${new Date().toISOString().slice(0, 10)}`;
+}
+
+function prependChangelog(root, heading, notes) {
+  const p = path.join(root, "CHANGELOG.md");
+  let old = "";
+  try {
+    old = fs.readFileSync(p, "utf8");
+  } catch {}
+  const next = old.trim()
+    ? old.replace(/^(#[^\n]*\n)/, `$1\n${heading}\n\n${notes}\n`)
+    : `# Changelog\n\n${heading}\n\n${notes}\n`;
+  fs.writeFileSync(p, next);
+  return p;
+}
+
+async function cmdChangelog(pos, flags) {
+  const cfg = loadConfig();
+  const ctx = mkCtx(flags, cfg);
+  const root = gitRoot(process.cwd());
+  if (!root) throw new UserErr("not inside a git repository");
+  const to = typeof flags.to === "string" ? flags.to : "HEAD";
+  const from = pos[0] || lastTag(root) || gitOut(["rev-list", "--max-parents=0", "HEAD"], root).split("\n")[0];
+  const commits = rangeCommits(root, from, to);
+  if (!commits.length) throw new UserErr(`no commits in range ${from}..${to}`);
+  banner();
+  console.log(dim(`range ${from}..${to} — ${commits.length} commits\n`));
+  const notes = await aiReleaseNotes(cfg, commits, null);
+  if (flags.json) return console.log(JSON.stringify({ range: `${from}..${to}`, commits: commits.length, markdown: notes }, null, 2));
+  console.log(cyan(notes) + "\n");
+  if (flags.write) {
+    const heading = changelogHeading(to === "HEAD" ? "Unreleased" : to);
+    if (await allow(`update CHANGELOG.md (${heading})`, ctx)) {
+      prependChangelog(root, heading, notes);
+      ok("CHANGELOG.md written");
+    } else warn("skipped CHANGELOG.md write");
+  }
+}
+
+async function cmdRelease(pos, flags) {
+  const cfg = loadConfig();
+  const ctx = mkCtx(flags, cfg);
+  const root = gitRoot(process.cwd());
+  if (!root) throw new UserErr("not inside a git repository");
+  const bump = (pos[0] || "").toLowerCase();
+  if (!["patch", "minor", "major"].includes(bump)) throw new UserErr("usage: gitmancer release patch|minor|major [--no-push] [--skip-gh] [--dry-run]");
+  const pkgPath = path.join(root, "package.json");
+  if (!fs.existsSync(pkgPath)) throw new UserErr("release needs a package.json in the repo root");
+  let pkg;
+  try {
+    pkg = JSON.parse(fs.readFileSync(pkgPath, "utf8"));
+  } catch {
+    throw new UserErr("package.json is not valid JSON");
+  }
+  const cur = String(pkg.version || "0.0.0");
+  const parts = cur.split(".").map((n) => parseInt(n, 10) || 0);
+  if (bump === "patch") parts[2] += 1;
+  else if (bump === "minor") {
+    parts[1] += 1;
+    parts[2] = 0;
+  } else {
+    parts[0] += 1;
+    parts[1] = 0;
+    parts[2] = 0;
+  }
+  const next = parts.join(".");
+  const tag = `v${next}`;
+
+  const from = lastTag(root) || gitOut(["rev-list", "--max-parents=0", "HEAD"], root).split("\n")[0];
+  const commits = rangeCommits(root, from, "HEAD");
+  banner();
+  console.log(dim(`release ${cur} → ${next} (${tag}) — ${commits.length} commits since ${from}\n`));
+  const notes = await aiReleaseNotes(cfg, commits, tag);
+
+  const plan = `bump ${cur} → ${next}, update CHANGELOG.md, commit + tag ${tag}${flags["no-push"] ? "" : " + push"}`;
+  if (flags["dry-run"]) {
+    console.log(cyan(notes) + "\n");
+    warn(`dry-run — would ${plan}`);
+    return;
+  }
+  if (!(await allow(plan, ctx))) return warn("release aborted");
+
+  prependChangelog(root, changelogHeading(`[${next}]`), notes);
+  const pkgText = fs.readFileSync(pkgPath, "utf8");
+  if (!/"version"\s*:/.test(pkgText)) throw new UserErr("package.json has no version field");
+  fs.writeFileSync(pkgPath, pkgText.replace(/("version"\s*:\s*")[^"]*(")/, `$1${next}$2`));
+  ok(`package.json ${cur} → ${next}, CHANGELOG.md updated`);
+
+  gitOut(["add", "package.json", "CHANGELOG.md"], root);
+  gitOut(["commit", "-m", `chore(release): ${tag}`], root);
+  gitOut(["tag", tag], root);
+  ok(`committed + tagged ${tag}`);
+
+  if (flags["no-push"]) return warn("not pushing (--no-push)");
+  gitOut(["push", "origin", "HEAD", "--follow-tags"], root);
+  ok("pushed commit + tag");
+
+  if (flags["skip-gh"]) return warn("skipping GitHub release (--skip-gh)");
+  const slug = parseOriginRepo(root);
+  if (!slug) return warn("no github origin — skipping GitHub release");
+  if (!(await allow(`create GitHub release ${tag} on ${slug}`, ctx))) return warn("skipped GitHub release");
+  try {
+    await gh(cfg, "POST", `/repos/${slug}/releases`, { tag_name: tag, name: tag, body: notes, draft: false, prerelease: false });
+    ok(`GitHub release ${tag} published`);
+  } catch (e) {
+    warn(`GitHub release failed: ${e.message} — tag is pushed, create it manually if needed`);
+  }
+}
+
 /* ---------------- review: AI code review of a pull request ---------------- */
 
 async function cmdReview(pos, flags) {
@@ -1806,6 +1961,10 @@ ${bold("COMMANDS")}
                     ${dim('--max 3  --yolo  --fast')}
   ${cyan("prbot")}                 watch a repo and AI-review every new pull request
                     ${dim('--repo owner/name  --interval 300  --once  --yolo')}
+  ${cyan("changelog")} [from]      AI release notes for a commit range (default: since last tag)
+                    ${dim('--to HEAD  --write (CHANGELOG.md)  --json')}
+  ${cyan("release")} patch|minor|major
+                    ${dim('bump version + CHANGELOG + tag + push + GitHub release  --no-push  --skip-gh  --dry-run')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -1833,7 +1992,7 @@ ${bold("EXAMPLES")}
 `);
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -1896,6 +2055,8 @@ async function main() {
     case "undo": return cmdUndo(pos, flags);
     case "watch": return cmdWatch(pos, flags);
     case "prbot": return cmdPrbot(pos, flags);
+    case "changelog": return cmdChangelog(pos, flags);
+    case "release": return cmdRelease(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
@@ -1903,7 +2064,7 @@ async function main() {
 }
 
 main()
-  .then(() => process.exit(0))
+  .then(() => process.exit(process.exitCode || 0))
   .catch((e) => {
     fail(e instanceof UserErr ? e.message : (e && e.stack) || String(e));
     process.exit(1);

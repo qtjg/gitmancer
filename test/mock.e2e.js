@@ -156,6 +156,9 @@ const server = http.createServer((req, res) => {
           batchCalls % 2 === 1
             ? { role: "assistant", content: null, tool_calls: [{ id: `batch_${batchCalls}`, type: "function", function: { name: "batch_edit", arguments: JSON.stringify({ path: "app.js", edits: [{ find: "var a = 1", replace: "var b = 1" }, { find: "var sum = a + 2", replace: "var sum = b + 2" }] }) } }] }
             : { role: "assistant", content: "batch done." };
+      } else if (/Keep-a-Changelog/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
+        // changelog/release release-notes flow → deterministic markdown
+        message = { role: "assistant", content: "### Added\n- MOCK-NOTE feature one (abc1234)\n### Fixed\n- MOCK-NOTE crash on start (def5678)" };
       } else if (/hello2/.test(String(lastUser))) {
         // budget flow: always demand a write so the budget check trips on the next step
         message = { role: "assistant", content: null, tool_calls: [{ id: "bud1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "hello2.txt", content: "budget" }) } }] };
@@ -472,6 +475,46 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("ship reports no push", /not pushing/.test(r.stdout || ""));
   const committed = spawnSync("git", ["log", "--oneline", "-1"], { cwd: shipDir, encoding: "utf8" }).stdout || "";
   check("commit created locally", /test: local commit/.test(committed));
+
+  console.log("→ changelog + release");
+  const relDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-rel-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: relDir });
+  spawnSync("git", ["config", "user.email", "t@t.local"], { cwd: relDir });
+  spawnSync("git", ["config", "user.name", "t"], { cwd: relDir });
+  fs.writeFileSync(path.join(relDir, "f.txt"), "one");
+  spawnSync("git", ["add", "."], { cwd: relDir });
+  spawnSync("git", ["commit", "-m", "feat: first thing"], { cwd: relDir });
+  fs.writeFileSync(path.join(relDir, "f.txt"), "two");
+  spawnSync("git", ["add", "."], { cwd: relDir });
+  spawnSync("git", ["commit", "-m", "fix: crash on start"], { cwd: relDir });
+  fs.writeFileSync(path.join(relDir, "package.json"), JSON.stringify({ name: "rel-fixture", version: "1.2.3" }, null, 2) + "\n");
+  spawnSync("git", ["add", "."], { cwd: relDir });
+  spawnSync("git", ["commit", "-m", "chore: add package"], { cwd: relDir });
+
+  r = await runCli(["changelog"], relDir, env);
+  check("changelog exits 0", r.status === 0);
+  check("changelog prints AI notes", /MOCK-NOTE/.test(r.stdout || ""));
+
+  r = await runCli(["changelog", "--write", "--yolo"], relDir, env);
+  check("changelog --write exits 0", r.status === 0);
+  const clText1 = fs.existsSync(path.join(relDir, "CHANGELOG.md")) ? fs.readFileSync(path.join(relDir, "CHANGELOG.md"), "utf8") : "";
+  check("changelog --write creates CHANGELOG.md", /MOCK-NOTE/.test(clText1) && /## Unreleased/.test(clText1));
+
+  r = await runCli(["release", "patch", "--no-push", "--yolo"], relDir, env);
+  check("release --no-push exits 0", r.status === 0);
+  let pkgNow = {};
+  try { pkgNow = JSON.parse(fs.readFileSync(path.join(relDir, "package.json"), "utf8")); } catch {}
+  check("release bumps version to 1.2.4", pkgNow.version === "1.2.4");
+  const relLog = spawnSync("git", ["log", "--oneline", "-1"], { cwd: relDir, encoding: "utf8" }).stdout || "";
+  check("release commit created", /chore\(release\): v1\.2\.4/.test(relLog));
+  const relTags = spawnSync("git", ["tag", "--list"], { cwd: relDir, encoding: "utf8" }).stdout || "";
+  check("release tag created", /v1\.2\.4/.test(relTags));
+  const clText2 = fs.existsSync(path.join(relDir, "CHANGELOG.md")) ? fs.readFileSync(path.join(relDir, "CHANGELOG.md"), "utf8") : "";
+  check("release writes CHANGELOG section", /## \[1\.2\.4\]/.test(clText2));
+  check("release notes reach CHANGELOG", /MOCK-NOTE/.test(clText2));
+
+  r = await runCli(["release", "banana"], relDir, env);
+  check("release rejects invalid bump", r.status !== 0);
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });

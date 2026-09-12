@@ -1,6 +1,6 @@
 {
   "name": "gitmancer",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "⚡ Zero-dependency AI CLI agent that codes, commits, pushes, and manages your whole GitHub account — any OpenAI-compatible AI key + a GitHub token.",
   "main": "gitmancer.js",
   "author": "Mayank Bhaskar <317509829+qtjg@users.noreply.github.com>",
