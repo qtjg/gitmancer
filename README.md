@@ -6,7 +6,7 @@ Give it any OpenAI-compatible AI key (Groq / OpenAI / OpenRouter / Z.ai / Ollama
 GitHub token, and it becomes a terminal-native agent that reads and writes your code, runs
 commands, commits, pushes, creates repos, and manages issues — you talk, it ships.
 
-![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![deps](https://img.shields.io/badge/dependencies-0-blue) ![license](https://img.shields.io/badge/license-MIT-orange) ![version](https://img.shields.io/badge/version-0.5.0-purple)
+![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![deps](https://img.shields.io/badge/dependencies-0-blue) ![license](https://img.shields.io/badge/license-MIT-orange) ![version](https://img.shields.io/badge/version-0.6.0-purple)
 
 ```bash
 $ gitmancer ask "add input validation to signup.js and run the tests"
@@ -28,6 +28,18 @@ Every frame below is **real CLI output**, captured with `gitmancer record` — v
 ![gitmancer demo — version · plugin system · secscan · help](docs/demo.gif)
 
 <sub>Terminal-native playback: <code>gitmancer replay docs/demo.cast</code> · regenerate both artifacts with <code>node scripts/gen-demo-cast.js && python3 scripts/cast-to-gif.py</code>.</sub>
+
+## What's new in v0.6.0 — plugins · MCP · completions · plans · sandbox
+
+- **`plugin`** — user plugin system: drop a `.js` file in `~/.gitmancer/plugins/` and it becomes a real command (`plugin new` scaffolds one) **and** can register first-class AI agent tools; mutating plugin tools go through the same confirm gate as built-ins. (#1 #11)
+- **`mcp`** — Model Context Protocol server over stdio JSON-RPC: IDEs and other agents get `repo_status`, `list_files`, `read_file`, `run_cmd` (read-only by default) and `secscan`. (#2 #10)
+- **`completions bash|zsh|fish`** — ready-to-install shell completion, per-command flags included. (#3)
+- **`record` / `replay`** — record any command into an asciinema v2 `.cast` and replay it later (this is how the README demo was made). (#4 #5)
+- **`plan` / `execute`** — AI drafts an ordered plan (`--write plan.json`), execute runs it step-by-step: shell steps confirm-gated and exit-checked, agent steps run the full agent; `--dry-run` / `--from` / `--only` / `--keep-going`. (#6)
+- **`.gitmancer.json` workspace profiles** — per-project model/steps/budget/exclude policy; `yolo` is deliberately not grantable from a file, secrets in a profile are refused. (#7)
+- **`usage`** — persistent per-call token & cost dashboard (`~/.gitmancer/usage.jsonl`), rough $ estimates from published rates, clearly labeled. (#8 #13)
+- **`ask --resume <id|last>`** — chat transcripts persist after every turn; pick a conversation back up exactly where it died. (#9)
+- **`--sandbox`** — agent shell commands run inside docker (network-off, cpu/mem caps) or bubblewrap (`--unshare-all`); no runtime → honest refusal, nothing executes. (#12)
 
 ## What's new in v0.5.0 — release autopilot · security · fleet · triage
 

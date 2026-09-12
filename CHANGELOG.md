@@ -3,6 +3,44 @@
 All notable changes to gitmancer are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.6.0] — 2026-09-12
+
+### Added
+- **`plugin list|new|remove|path`** — user plugin system: `~/.gitmancer/plugins/*.js`
+  provide both new CLI commands (`run()`) and first-class AI agent tools
+  (`tools[]`); mutating plugin tools pass the same confirm gate as built-ins.
+- **`mcp`** — MCP server mode: gitmancer tools (`repo_status`, `list_files`,
+  `read_file`, `run_cmd`, `secscan`) exposed over stdio JSON-RPC (protocol
+  2024-11-05) for IDEs and other agents; read-only by default, mutating
+  `run_cmd` requires `GITMANCER_MCP_ALLOW_RUN=1`.
+- **`completions bash|zsh|fish`** — shell completion scripts with per-command
+  flags and `--preset`/`--state` value completion; live-tested by sourcing the
+  generated script and resolving completions.
+- **`record "<cmd>"` / `replay <file|--list>`** — asciinema v2 session recording
+  with live tee-through; replays any v2 cast with `--speed`, idle gaps capped
+  (and labelled as such).
+- **`plan "<goal>" --write plan.json` / `execute [plan.json]`** — plan/execute
+  orchestration: AI drafts ordered steps (max 12), execute runs shell steps
+  confirm-gated + exit-checked and agent steps through the full agent;
+  `--from` / `--only` / `--dry-run` / `--keep-going` / `--json`.
+- **`.gitmancer.json` workspace profiles** — per-project `model` / `base` /
+  `preset` / `steps` / `budget` / `flags` (whitelist: fast, verify, chat) /
+  `exclude`; `yolo` cannot be granted from a profile; secret-shaped keys are
+  detected, ignored and called out; `profile [init]` shows the merged view.
+- **`usage [--since N|--all|--json|--reset]`** — durable per-call usage log
+  (`~/.gitmancer/usage.jsonl`) with per-command token totals and estimated cost
+  from published $/1M rates (labelled as estimates, not a bill).
+- **`ask --resume <id|last>`** — chat session persistence: transcripts saved
+  after every turn to `~/.gitmancer/sessions/chat/`, restorable with full
+  context.
+- **`--sandbox`** (ask/fix/watch) — `run_cmd` wrapped in docker
+  (`--network=none`, memory/CPU caps) or bubblewrap (`--unshare-all`);
+  no runtime available → honest refusal and nothing executes.
+
+### Changed
+- e2e suite grown from 138 to 223 live checks (mock AI + mock GitHub + real
+  stdio MCP server + real shell completions + real record/replay round-trips).
+
 ## [0.5.0] — 2026-09-12
 
 ### Added
