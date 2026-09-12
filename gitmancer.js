@@ -2147,6 +2147,79 @@ async function cmdTriage(pos, flags) {
   }
 }
 
+/* ---------------- hook: install managed git hooks that run secscan ---------------- */
+
+const HOOK_BEGIN = "# >>> gitmancer hook >>>";
+const HOOK_END = "# <<< gitmancer hook <<<";
+const HOOK_NAMES = ["pre-commit", "pre-push", "commit-msg"];
+
+function hookBlock(hookName) {
+  const scan = hookName === "pre-commit" ? "secscan --staged" : "secscan";
+  return [HOOK_BEGIN, "command -v gitmancer >/dev/null 2>&1 || exit 0", `gitmancer ${scan} || exit 1`, HOOK_END, ""].join("\n");
+}
+
+async function cmdHook(pos, flags) {
+  if (!flags.json) banner();
+  const action = pos[0] || "list";
+  const root = gitRoot(process.cwd());
+  if (action === "list") {
+    const hooksDir = root ? path.join(root, ".git", "hooks") : null;
+    if (!hooksDir || !fs.existsSync(hooksDir)) return info("no hooks directory — run inside a git repository");
+    const files = fs.readdirSync(hooksDir).sort().filter((f) => !f.endsWith(".sample"));
+    if (!files.length) return info("no hooks installed");
+    for (const f of files) {
+      const p = path.join(hooksDir, f);
+      if (!fs.statSync(p).isFile()) continue;
+      const managed = fs.readFileSync(p, "utf8").includes(HOOK_BEGIN);
+      console.log(`  ${managed ? green("✔") : dim("·")} ${f}${managed ? dim("  (gitmancer-managed)") : ""}`);
+    }
+    return;
+  }
+  if (action !== "install" && action !== "uninstall") {
+    throw new UserErr("usage: gitmancer hook list | hook install [pre-commit|pre-push|commit-msg] | hook uninstall <name>");
+  }
+  if (!root) throw new UserErr("hook install/uninstall must run inside a git repository");
+  const hookName = pos[1] || "pre-commit";
+  if (!HOOK_NAMES.includes(hookName)) throw new UserErr(`hook must be one of: ${HOOK_NAMES.join(" | ")}`);
+  const hooksDir = path.join(root, ".git", "hooks");
+  const hp = path.join(hooksDir, hookName);
+  if (action === "install") {
+    if (!fs.existsSync(hooksDir)) fs.mkdirSync(hooksDir, { recursive: true });
+    let old = "";
+    let managed = false;
+    if (fs.existsSync(hp)) {
+      old = fs.readFileSync(hp, "utf8");
+      managed = old.includes(HOOK_BEGIN);
+      if (!managed && old.trim() && !flags.force) {
+        const ans = flags.yolo ? "y" : ((await askUser(`${yellow(`${hookName} already exists — append the gitmancer block?`)} [y/N] `)) ?? "").trim().toLowerCase();
+        if (ans !== "y" && ans !== "yes") return info("aborted — existing hook untouched");
+      }
+    }
+    const block = hookBlock(hookName);
+    const next = managed
+      ? old.replace(new RegExp(`${HOOK_BEGIN.replace(/[*>]/g, "\\$&")}[\\s\\S]*?${HOOK_END.replace(/[*>]/g, "\\$&")}\\n?`), block)
+      : old + (old && !old.endsWith("\n") ? "\n" : "") + block;
+    fs.writeFileSync(hp, next, { mode: 0o755 });
+    try {
+      fs.chmodSync(hp, 0o755);
+    } catch {}
+    ok(`gitmancer block ${managed ? "replaced in" : old.trim() ? "appended to" : "created"} .git/hooks/${hookName}`);
+    console.log(dim(`runs: gitmancer ${hookName === "pre-commit" ? "secscan --staged" : "secscan"} — non-zero exit blocks the ${hookName === "pre-push" ? "push" : "commit"}`));
+  } else {
+    if (!fs.existsSync(hp)) return info(`no .git/hooks/${hookName} — nothing to remove`);
+    const old = fs.readFileSync(hp, "utf8");
+    if (!old.includes(HOOK_BEGIN)) return info(`no gitmancer block in ${hookName} — nothing to remove`);
+    const next = old.replace(new RegExp(`${HOOK_BEGIN.replace(/[*>]/g, "\\$&")}[\\s\\S]*?${HOOK_END.replace(/[*>]/g, "\\$&")}\\n?`), "").trim();
+    if (next) {
+      fs.writeFileSync(hp, next + "\n");
+      ok(`gitmancer block removed from ${hookName} — user code kept`);
+    } else {
+      fs.rmSync(hp);
+      ok(`${hookName} removed (was gitmancer-only)`);
+    }
+  }
+}
+
 /* ---------------- review: AI code review of a pull request ---------------- */
 
 async function cmdReview(pos, flags) {
@@ -2387,6 +2460,8 @@ ${bold("COMMANDS")}
                     ${dim('status | pull | secscan | run "<cmd>"   --root <dir>  --json')}
   ${cyan("triage")} <owner/repo>   AI triage of open issues — priority/type/label + rationale
                     ${dim('--apply (write labels)  --limit 20  --json  --yolo')}
+  ${cyan("hook")} list|install|uninstall [name]
+                    ${dim('managed git hooks that run secscan — pre-commit (default) | pre-push | commit-msg  --force')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2413,6 +2488,9 @@ ${bold("EXAMPLES")}
   gitmancer issue me/myrepo create "Bug: login fails on Safari"
   gitmancer secscan --staged             ${dim("# block secrets before they're committed")}
   gitmancer hook install pre-commit      ${dim("# enforce secscan on every commit")}
+  gitmancer triage me/myrepo --apply     ${dim("# AI-prioritize issues & label them")}
+  gitmancer explain HEAD~1..HEAD         ${dim("# what did this change just do?")}
+  gitmancer fleet status --root ~/code   ${dim("# every repo under ~/code at a glance")}
 `);
 }
 
@@ -2486,6 +2564,7 @@ async function main() {
     case "explain": return cmdExplain(pos, flags);
     case "fleet": return cmdFleet(pos, flags);
     case "triage": return cmdTriage(pos, flags);
+    case "hook": return cmdHook(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);

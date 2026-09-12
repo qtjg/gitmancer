@@ -649,6 +649,25 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   r = await runCli(["triage", "acme/widget"], tmp, env);
   check("triage dry run says so", /dry run/.test(r.stdout || ""));
 
+  console.log("→ hook installer: managed pre-commit block, idempotent, uninstallable");
+  const hkDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-hook-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: hkDir });
+  r = await runCli(["hook", "install", "pre-commit", "--yolo"], hkDir, env);
+  check("hook install exits 0", r.status === 0);
+  const hp = path.join(hkDir, ".git", "hooks", "pre-commit");
+  check("pre-commit hook created with secscan", fs.existsSync(hp) && /gitmancer secscan --staged/.test(fs.readFileSync(hp, "utf8")));
+  r = await runCli(["hook", "install", "pre-commit", "--yolo"], hkDir, env);
+  const hookText = fs.readFileSync(hp, "utf8");
+  check("hook install is idempotent (single block)", (hookText.match(/gitmancer hook >>>/g) || []).length === 1);
+  check("hook file is executable", !!(fs.statSync(hp).mode & 0o111));
+  r = await runCli(["hook", "list"], hkDir, env);
+  check("hook list shows managed hook", /pre-commit/.test(r.stdout || "") && /gitmancer-managed/.test(r.stdout || ""));
+  r = await runCli(["hook", "uninstall", "pre-commit"], hkDir, env);
+  check("hook uninstall exits 0", r.status === 0);
+  check("uninstall removed the gitmancer-only hook", !fs.existsSync(hp));
+  r = await runCli(["hook", "install", "banana"], hkDir, env);
+  check("hook rejects unknown hook name", r.status !== 0);
+
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
   if (failed.length) {
