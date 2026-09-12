@@ -320,10 +320,33 @@ function sseAccumulator(onDelta) {
   };
 }
 
-/* ---------------- usage metering ---------------- */
+/* ---------------- usage metering (#8 #13) ---------------- */
 
 const USAGE = { calls: 0, prompt: 0, completion: 0, est: 0 };
 const estTokens = (s) => Math.ceil((s || "").length / 4);
+let CURRENT_CMD = "ai"; // set in main()
+let _lastModel = "unknown"; // set in aiChatProvider
+let _prevUsage = { p: 0, c: 0 };
+const USAGE_LOG_FILE = () => path.join(CONFIG_DIR, "usage.jsonl");
+
+// rough published $/1M-token rates, labeled as estimates everywhere they print
+const COST_TABLE = [
+  [/llama-3\.1-8b/i, 0.05, 0.08],
+  [/llama-3\.3-70b/i, 0.59, 0.79],
+  [/gpt-4o-mini/i, 0.15, 0.6],
+  [/gpt-4o/i, 2.5, 10],
+  [/deepseek/i, 0.14, 0.28],
+  [/glm-4-flash/i, 0, 0],
+  [/glm-4/i, 0.6, 2.2],
+  [/ollama|localhost|127\.0\.0\.1/i, 0, 0],
+];
+function estCost(model, pin, pout) {
+  for (const [re, cin, cout] of COST_TABLE) {
+    if (re.test(String(model || ""))) return (pin / 1e6) * cin + (pout / 1e6) * cout;
+  }
+  return (pin / 1e6) * 0.25 + (pout / 1e6) * 1.0; // conservative generic rate
+}
+
 function recordUsage(messages, reply, usage) {
   USAGE.calls++;
   if (usage && Number.isFinite(usage.prompt_tokens)) {
@@ -334,6 +357,17 @@ function recordUsage(messages, reply, usage) {
     USAGE.prompt += estTokens(JSON.stringify(messages || []));
     USAGE.completion += estTokens(reply && reply.content);
   }
+  // durable per-call log (#8 #13) — best effort, never breaks a run
+  try {
+    const dIn = USAGE.prompt - _prevUsage.p;
+    const dOut = USAGE.completion - _prevUsage.c;
+    _prevUsage = { p: USAGE.prompt, c: USAGE.completion };
+    fs.mkdirSync(CONFIG_DIR, { recursive: true, mode: 0o700 });
+    fs.appendFileSync(
+      USAGE_LOG_FILE(),
+      JSON.stringify({ at: new Date().toISOString(), cmd: CURRENT_CMD, model: _lastModel, prompt: dIn, completion: dOut, est: usage ? false : true }) + "\n"
+    );
+  } catch {}
 }
 function usageLine() {
   const tot = USAGE.prompt + USAGE.completion;
@@ -362,6 +396,7 @@ async function aiChat(cfg, messages, tools, opts = {}) {
 
 async function aiChatProvider(cfg, messages, tools, opts = {}) {
   const isLocal = /localhost|127\.0\.0\.1/.test(cfg.aiBase);
+  _lastModel = cfg.aiModel; // for the per-call usage log (#8 #13)
   if (!cfg.aiKey && !isLocal) {
     throw new UserErr("No AI key. Run `gitmancer setup` or export GITMANCER_AI_KEY.");
   }
@@ -3146,6 +3181,77 @@ function cmdProfile(pos, flags) {
   console.log("");
 }
 
+/* ---------------- usage dashboard command (#8 #13) ---------------- */
+
+function cmdUsage(pos, flags) {
+  const f = USAGE_LOG_FILE();
+  if (flags.reset) {
+    if (fs.existsSync(f)) {
+      fs.writeFileSync(f, "");
+      ok(`usage log cleared (${f})`);
+    } else ok("nothing to clear — no usage log yet");
+    return;
+  }
+  const rows = [];
+  if (fs.existsSync(f)) {
+    for (const l of fs.readFileSync(f, "utf8").split("\n")) {
+      if (!l.trim()) continue;
+      try {
+        const j = JSON.parse(l);
+        if (j && j.at) rows.push(j);
+      } catch {}
+    }
+  }
+  const days = flags.all ? 0 : parseInt(flags.since, 10) || 7;
+  const cutoff = days ? Date.now() - days * 86400000 : 0;
+  const filtered = cutoff ? rows.filter((r) => new Date(r.at).getTime() >= cutoff) : rows;
+  if (!flags.json) banner();
+  if (!filtered.length) {
+    console.log(`no AI usage recorded ${days ? "in the last " + days + " day(s)" : "yet"} — the log fills automatically as AI commands run ${dim("(" + f + ")")}\n`);
+    return;
+  }
+  const byCmd = new Map();
+  let estCount = 0;
+  for (const r of filtered) {
+    const k = String(r.cmd || "ai");
+    const e = byCmd.get(k) || { calls: 0, prompt: 0, completion: 0, cost: 0 };
+    e.calls++;
+    e.prompt += Number(r.prompt) || 0;
+    e.completion += Number(r.completion) || 0;
+    e.cost += estCost(r.model, Number(r.prompt) || 0, Number(r.completion) || 0);
+    byCmd.set(k, e);
+    if (r.est) estCount++;
+  }
+  const pin = filtered.reduce((a, r) => a + (Number(r.prompt) || 0), 0);
+  const pout = filtered.reduce((a, r) => a + (Number(r.completion) || 0), 0);
+  const cost = [...byCmd.values()].reduce((a, e) => a + e.cost, 0);
+  if (flags.json) {
+    return console.log(
+      JSON.stringify(
+        {
+          window: days ? `last ${days} day(s)` : "all time",
+          calls: filtered.length,
+          promptTokens: pin,
+          completionTokens: pout,
+          estimatedCostUsd: +cost.toFixed(4),
+          estimatedTokenCounts: estCount > 0,
+          byCommand: [...byCmd.entries()].map(([cmd, e]) => ({ cmd, ...e, costUsd: +e.cost.toFixed(4) })),
+        },
+        null,
+        2
+      )
+    );
+  }
+  console.log(`\n${bold("AI usage")} ${dim(days ? "· last " + days + " day(s) (--all for everything)" : "· all time")}\n`);
+  console.log(`  ${bold("command")}${" ".repeat(14)}${bold("calls")}   ${bold("tokens in")}   ${bold("tokens out")}  ${bold("~cost")}`);
+  for (const [cmd, e] of [...byCmd.entries()].sort((a, b) => b[1].cost - a[1].cost)) {
+    console.log(`  ${cyan(cmd.padEnd(20))} ${String(e.calls).padStart(5)}   ${String(e.prompt).padStart(10)}   ${String(e.completion).padStart(10)}  ${("$" + e.cost.toFixed(4)).padStart(7)}`);
+  }
+  console.log(dim("  " + "─".repeat(64)));
+  console.log(`  ${bold("total".padEnd(20))} ${String(filtered.length).padStart(5)}   ${String(pin).padStart(10)}   ${String(pout).padStart(10)}  ${("$" + cost.toFixed(4)).padStart(7)}${estCount ? yellow("  · counts include " + estCount + " estimated call(s)") : ""}`);
+  console.log(dim("\n  costs are rough estimates from published $/1M rates — not a bill\n"));
+}
+
 /* ---------------- help / arg parsing / main ---------------- */
 
 function help() {
@@ -3218,6 +3324,8 @@ ${bold("COMMANDS")}
                     ${dim('--from N  --only 1,3  --dry-run  --keep-going  --yolo  --fast  --json')}
   ${cyan("profile")} [init]           show this workspace's .gitmancer.json profile + merged effective config
                     ${dim('init [--force] scaffolds one — safe keys only, secrets stay in the global config')}
+  ${cyan("usage")}                   token + cost dashboard from the persistent per-call log
+                    ${dim('--since N days (default 7)  --all  --json  --reset')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -3298,6 +3406,7 @@ async function main() {
   const { cmd, pos, flags } = parseArgs(argv);
   if (flags["no-color"] || process.env.NO_COLOR) FORCE_COLOR_OFF = true;
   loadPlugins(); // plugin commands + agent tools (#1 #11) — before any dispatch
+  CURRENT_CMD = cmd || "ai"; // per-call usage log attribution (#8 #13)
   if (flags.version || flags.v) return console.log(`${NAME} v${VERSION}`);
   if (flags.help || flags.h) return help();
   if (!cmd || cmd === "help") return help();
@@ -3341,6 +3450,8 @@ async function main() {
     case "plan": return cmdPlan(pos, flags);
     case "execute": return cmdExecute(pos, flags);
     case "profile": return cmdProfile(pos, flags);
+    case "usage":
+    case "cost": return cmdUsage(pos, flags);
     default:
       // plugin-defined commands (#1 #11) win before the ask-fallback
       if (PLUGIN_COMMANDS.has(cmd)) {

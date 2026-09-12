@@ -897,6 +897,31 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
     check("profile init --force scaffolds template", r.status === 0 && /_comment/.test(fs.readFileSync(path.join(profDir, ".gitmancer.json"), "utf8")));
   }
 
+  console.log("→ usage dashboard (#8 #13): durable per-call log + token/cost totals");
+  {
+    const useHome = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-use-"));
+    const useEnv = { ...env, HOME: useHome };
+    const before = aiCalls;
+    r = await runCli(["ask", "usage probe one", "--yolo"], tmp, useEnv);
+    check("usage ask #1 exits 0", r.status === 0);
+    r = await runCli(["status", "--repo", "acme/widget"], tmp, useEnv);
+    const ulog = path.join(useHome, ".gitmancer", "usage.jsonl");
+    check("usage.jsonl created by AI runs", fs.existsSync(ulog));
+    const ulines = fs.existsSync(ulog) ? fs.readFileSync(ulog, "utf8").split("\n").filter(Boolean) : [];
+    check("every AI call logged with cmd+model+tokens", ulines.length >= aiCalls - before && ulines.every((l) => { const j = JSON.parse(l); return j.cmd && j.model && Number.isFinite(j.prompt) && Number.isFinite(j.completion); }));
+    r = await runCli(["usage"], tmp, useEnv);
+    check("usage dashboard renders totals", r.status === 0 && /total/.test(r.stdout || "") && /~cost/.test(r.stdout || ""));
+    check("usage attributes the ask command", /ask/.test(r.stdout || ""));
+    r = await runCli(["usage", "--json"], tmp, useEnv);
+    let uj = null;
+    try { uj = JSON.parse(r.stdout); } catch {}
+    check("usage --json parses with byCommand", !!uj && Array.isArray(uj.byCommand) && uj.calls >= 2 && uj.promptTokens > 0);
+    r = await runCli(["usage", "--reset", "--yolo"], tmp, useEnv);
+    check("usage --reset clears the log", r.status === 0 && fs.readFileSync(ulog, "utf8").trim() === "");
+    r = await runCli(["usage"], tmp, useEnv);
+    check("usage empty state honest", r.status === 0 && /no AI usage recorded/.test(r.stdout || ""));
+  }
+
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
   if (failed.length) {
