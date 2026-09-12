@@ -20,10 +20,17 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [S
 - **`batch_edit` agent tool** — several exact string replacements inside one
   file per call; each `find` must match exactly once unless `replace_all`;
   confirm-gated like `write_file`, journaled for undo.
-- 18 new e2e checks → 77 total: memory auto-load into the system prompt,
+- **`prbot`** — polls open PRs on a repo and AI-reviews each new head
+  (severity-tagged findings posted as a PR comment, confirm-gated);
+  `--interval 300` daemon sweep or `--once` single pass; reviewed heads
+  remembered in `~/.gitmancer/prbot.json` so re-runs skip them.
+- **Token metering + `--budget`** — `usage:` summary line after agent runs
+  (real provider usage when reported, ~char/4 estimates otherwise);
+  `ask --budget N` stops the loop when the soft token cap is exceeded.
+- 26 new e2e checks → 85 total: memory auto-load into the system prompt,
   memory template creation, undo round-trip (overwrite → restore),
   batch_edit multi-replacement, watch green-first-run and watch red → AI fix
-  → green loop.
+  → green loop, prbot review + skip-on-rerun, budget stop, usage line.
 
 ## [0.3.1] — 2026-09-12
 

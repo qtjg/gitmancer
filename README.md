@@ -27,6 +27,8 @@ commit: feat(auth): validate signup inputs + rate-limit guard
 - **`undo`** — every agent file change is journaled to `~/.gitmancer/undo-journal.jsonl` (prior content kept); `gitmancer undo` reverts the last change, `gitmancer undo 5` reverts five. Fearless automation.
 - **`watch "<cmd>"`** — run a command; if it fails the agent auto-fixes the code and re-runs until green (`--max 3` by default). Like `fix`, but loop-tolerant.
 - **`batch_edit` agent tool** — the model can now make several exact string replacements in one file per call instead of rewriting whole files → fewer tokens, faster turns, smaller diffs. Exact-match enforced: a `find` matching multiple locations must pass `replace_all`.
+- **`prbot`** — watches a repo and AI-reviews every new pull request automatically (`--repo owner/name`, `--interval 300` sweep, `--once` for CI/single pass). Remembers reviewed heads in `~/.gitmancer/prbot.json`, posts severity-tagged verdicts as PR comments (confirm-gated unless `--yolo`).
+- **Token metering + `--budget`** — every run now prints a `usage:` line (AI calls · tokens in/out, real numbers when the provider reports usage, estimates otherwise); `ask --budget 200000` stops the agent loop when the soft cap is hit.
 
 <details>
 <summary>What was new in v0.3.1</summary>
