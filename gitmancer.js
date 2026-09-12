@@ -2576,6 +2576,112 @@ next steps:
   throw new UserErr(`unknown plugin subcommand "${sub}" — try list | new <name> | remove <name> | path`);
 }
 
+/* ---------------- shell completions (#3): bash / zsh / fish ---------------- */
+
+const COMPLETION_COMMANDS = [
+  ["setup", ["--preset", "--key", "--token", "--model", "--base", "--ghBase"]],
+  ["config", []],
+  ["whoami", ["--json"]],
+  ["repos", ["--limit", "--json"]],
+  ["ask", ["--yolo", "--chat", "--fast", "--steps", "--cwd", "--budget", "--verify"]],
+  ["fix", ["--yolo", "--fast", "--cwd"]],
+  ["ship", ["--no-push"]],
+  ["newrepo", ["--private", "--public", "--source", "--desc", "--m", "--template"]],
+  ["issue", ["--state", "--limit", "--json"]],
+  ["pr", ["--base", "--head", "--repo", "--title", "--body", "--yolo", "--state", "--json", "--squash", "--rebase", "--subject"]],
+  ["status", ["--repo", "--json"]],
+  ["review", ["--repo", "--fast"]],
+  ["sweep", ["--limit", "--json"]],
+  ["doctor", []],
+  ["memory", []],
+  ["undo", []],
+  ["watch", ["--max", "--yolo", "--fast", "--cwd"]],
+  ["prbot", ["--repo", "--interval", "--once", "--yolo"]],
+  ["changelog", ["--to", "--write", "--json"]],
+  ["release", ["--no-push", "--skip-gh", "--dry-run"]],
+  ["secscan", ["--staged", "--path", "--json"]],
+  ["testgen", ["--write", "--yolo", "--fast"]],
+  ["explain", ["--fast"]],
+  ["fleet", ["--root", "--json"]],
+  ["triage", ["--apply", "--limit", "--json", "--yolo"]],
+  ["hook", ["--force"]],
+  ["plugin", ["--json", "--force", "--yolo"]],
+  ["mcp", []],
+  ["help", []],
+  ["version", []],
+];
+
+function completionsScript(shell) {
+  const cmds = COMPLETION_COMMANDS.map(([c]) => c);
+  const allFlags = [...new Set(COMPLETION_COMMANDS.flatMap(([, f]) => f))].sort();
+  if (shell === "bash") {
+    const perCmdCase = COMPLETION_COMMANDS.filter(([, f]) => f.length)
+      .map(([c, f]) => `      ${c}) COMPREPLY=( $(compgen -W "${f.join(" ")}" -- "$cur") ); return 0 ;;`)
+      .join("\n");
+    return `# gitmancer bash completion — v${VERSION}
+# install:  gitmancer completions bash > /etc/bash_completion.d/gitmancer   (or source it in ~/.bashrc)
+_gitmancer_completions() {
+  local cur prev cmds
+  COMPREPLY=()
+  cur="\${COMP_WORDS[COMP_CWORD]}"
+  prev="\${COMP_WORDS[COMP_CWORD-1]}"
+  cmds="${cmds.join(" ")}"
+  case "\$prev" in
+    --preset) COMPREPLY=( \$(compgen -W "groq openai openrouter zai ollama custom" -- "\$cur") ); return 0 ;;
+    --state)  COMPREPLY=( \$(compgen -W "open closed all" -- "\$cur") ); return 0 ;;
+  esac
+  if [[ "\$cur" == --* ]]; then
+    case "\${COMP_WORDS[1]}" in
+${perCmdCase}
+      *) COMPREPLY=( \$(compgen -W "${allFlags.join(" ")}" -- "\$cur") ) ;;
+    esac
+    return 0
+  fi
+  COMPREPLY=( \$(compgen -W "\$cmds" -- "\$cur") )
+  return 0
+}
+complete -F _gitmancer_completions gitmancer
+`;
+  }
+  if (shell === "zsh") {
+    const zcmd = cmds.map((c) => `'${c}'`).join(" ");
+    const zflags = allFlags.map((f) => `'${f}'`).join(" ");
+    return `#compdef gitmancer — v${VERSION}
+# install:  gitmancer completions zsh > ~/.zfunc/_gitmancer   (add ~/.zfunc to fpath first)
+_gitmancer() {
+  local -a cmds
+  cmds=( ${zcmd} )
+  if (( CURRENT <= 2 )); then
+    _describe 'command' cmds
+    _values 'flag' ${zflags}
+  else
+    _values 'flag' ${zflags}
+  fi
+  return 0
+}
+compdef _gitmancer gitmancer
+`;
+  }
+  if (shell === "fish") {
+    const fishCmds = cmds.map((c) => `complete -c gitmancer -n "__fish_use_subcommand" -a "${c}" -d "gitmancer ${c}"`);
+    const fishFlags = COMPLETION_COMMANDS.filter(([, f]) => f.length).map(([c, f]) => f.map((fl) => `complete -c gitmancer -n "__fish_seen_subcommand_from ${c}" -l "${fl.slice(2)}"`).join("\n"));
+    return `# gitmancer fish completion — v${VERSION}
+# install:  gitmancer completions fish > ~/.config/fish/completions/gitmancer.fish
+${fishCmds.join("\n")}
+${fishFlags.join("\n")}
+`;
+  }
+  throw new UserErr(`unsupported shell "${shell}" — use bash | zsh | fish`);
+}
+
+function cmdCompletions(pos) {
+  const shell = String(pos[0] || "").toLowerCase();
+  if (!["bash", "zsh", "fish"].includes(shell)) {
+    throw new UserErr(`usage: ${NAME} completions bash|zsh|fish — pipe the output into a completion file (see header of each script)`);
+  }
+  process.stdout.write(completionsScript(shell));
+}
+
 /* ---------------- MCP server mode (#2 #10): gitmancer tools over stdio JSON-RPC ----------------
  *
  * `gitmancer mcp` speaks the Model Context Protocol (newline-delimited JSON-RPC 2.0
@@ -2783,6 +2889,7 @@ ${bold("COMMANDS")}
                     ${dim('list [--json] · new <name> [--force] · remove <name> [--yolo] · path')}
   ${cyan("mcp")}                   run as an MCP server (stdio JSON-RPC) — expose gitmancer tools to IDEs & agents
                     ${dim('read-only by default · GITMANCER_MCP_ALLOW_RUN=1 lifts the run gate')}
+  ${cyan("completions")} bash|zsh|fish  print a shell completion script — source it or drop it in your completion dir
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2824,7 +2931,7 @@ ${bold("PLUGINS")} ${dim("(" + PLUGIN_COMMANDS.size + " command" + (PLUGIN_COMMA
   }
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud", "skip-gh", "dry-run"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -2899,6 +3006,8 @@ async function main() {
     case "plugin": return cmdPlugin(pos, flags);
     case "mcp":
     case "mcp-server": return cmdMcp(pos, flags);
+    case "completions":
+    case "completion": return cmdCompletions(pos, flags);
     default:
       // plugin-defined commands (#1 #11) win before the ask-fallback
       if (PLUGIN_COMMANDS.has(cmd)) {

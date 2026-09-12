@@ -779,6 +779,31 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
     check("mcp exits cleanly on stdin close", true);
   }
 
+  console.log("→ shell completions (#3): bash/zsh/fish scripts + live bash resolution");
+  r = await runCli(["completions", "bash"], tmp, env);
+  check("completions bash exits 0", r.status === 0);
+  check("bash script has complete -F", /complete -F _gitmancer_completions gitmancer/.test(r.stdout || ""));
+  check("bash script lists every command", ["secscan", "triage", "fleet", "plugin", "mcp", "completions"].every((c) => (r.stdout || "").includes(c)));
+  r = await runCli(["completions", "zsh"], tmp, env);
+  check("zsh script has #compdef", /#compdef gitmancer/.test(r.stdout || "") && /compdef _gitmancer gitmancer/.test(r.stdout || ""));
+  r = await runCli(["completions", "fish"], tmp, env);
+  check("fish script uses complete -c", /complete -c gitmancer/.test(r.stdout || "") && /__fish_seen_subcommand_from secscan/.test(r.stdout || ""));
+  r = await runCli(["completions", "tcsh"], tmp, env);
+  check("unknown shell rejected", r.status !== 0 && /bash\|zsh\|fish/.test((r.stderr || "") + (r.stdout || "")));
+  {
+    // live check: source the bash script and complete "sec<tab>"
+    const bashScript = (await runCli(["completions", "bash"], tmp, env)).stdout;
+    fs.writeFileSync("/tmp/_gitmancer_test_completion.sh", bashScript);
+    const probe = spawnSync("bash", [
+      "-c",
+      `source /tmp/_gitmancer_test_completion.sh; COMP_WORDS=(gitmancer sec); COMP_CWORD=1; _gitmancer_completions; echo "\${COMPREPLY[*]}"`,
+    ]);
+    check("live bash completion resolves secscan", probe.status === 0 && /secscan/.test(probe.stdout || ""));
+    const probe2 = spawnSync("bash", ["-c", `source /tmp/_gitmancer_test_completion.sh; COMP_WORDS=(gitmancer secscan --); COMP_CWORD=2; _gitmancer_completions; echo "\${COMPREPLY[*]}"`]);
+    check("live bash completion offers secscan flags", probe2.status === 0 && /--staged/.test(probe2.stdout || "") && /--json/.test(probe2.stdout || ""));
+    fs.rmSync("/tmp/_gitmancer_test_completion.sh", { force: true });
+  }
+
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
   if (failed.length) {
