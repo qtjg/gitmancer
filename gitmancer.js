@@ -445,6 +445,108 @@ function safePath(cwd, p) {
   return abs;
 }
 
+/* ---------------- plugin system (#1 #11): user commands + agent tools, no fork ----------------
+
+ * A plugin is a plain .js file in ~/.gitmancer/plugins/. It runs with the same
+ * trust level as gitmancer itself (full node access) — only install plugins you wrote
+ * or reviewed. Shape:
+ *
+ *   module.exports = {
+ *     name: "hello", version: "1.0.0", description: "…",
+ *     usage: "[--loud] …",                      // shown in `gitmancer help` PLUGINS section
+ *     run: async ({ args, flags, cwd, cfg, ctx }) => "text to print (or null)",
+ *     tools: [{                                  // optional: expose tools to the AI agent
+ *       name: "dice", description: "…", mutating: false,
+ *       parameters: { sides: { type: "number", description: "…" } }, required: ["sides"],
+ *       execute: async (args, ctx) => "tool result string",
+ *     }],
+ *   };
+\*/
+
+const PLUGIN_DIR = path.join(CONFIG_DIR, "plugins");
+const PLUGINS = []; // loaded metadata, in file order
+const PLUGIN_COMMANDS = new Map(); // command name → { run, usage, description, file }
+const PLUGIN_TOOLS = new Map(); // tool name → { execute, mutating, description, file }
+
+function pluginToolSchemas() {
+  const out = [];
+  for (const [name, p] of PLUGIN_TOOLS) out.push(t(name, p.description || `plugin tool ${name}`, p.parameters, p.required));
+  return out;
+}
+
+const PLUGIN_TEMPLATE = `// gitmancer plugin — drop-in file, loaded at every startup.
+// Command:  gitmancer hello [--loud]      Tool (for the AI agent): dice
+"use strict";
+module.exports = {
+  name: "hello",
+  version: "1.0.0",
+  description: "says hello + adds a dice tool to the agent",
+  usage: "[--loud]  — greet; --loud shouts",
+  run: async ({ flags }) => (flags.loud ? "HELLO FROM A PLUGIN ⚡" : "hello from a plugin ⚡"),
+  tools: [
+    {
+      name: "dice",
+      description: "Roll an N-sided dice and return the result. Use for any random pick between 1 and N.",
+      mutating: false,
+      parameters: { sides: { type: "number", description: "Number of sides (2-1000)" } },
+      required: ["sides"],
+      execute: async (args) => {
+        const sides = Math.min(Math.max(parseInt(args.sides, 10) || 6, 2), 1000);
+        return "rolled " + (1 + Math.floor(Math.random() * sides)) + " (d" + sides + ")";
+      },
+    },
+  ],
+};
+`;
+
+function loadPlugins() {
+  let files = [];
+  try {
+    if (fs.existsSync(PLUGIN_DIR)) files = fs.readdirSync(PLUGIN_DIR).sort();
+  } catch (e) {
+    warn(`cannot read plugin dir ${PLUGIN_DIR}: ${e.message}`);
+    return;
+  }
+  for (const f of files) {
+    if (!/\.(js|cjs)$/.test(f) || f.endsWith(".disabled")) continue;
+    const file = path.join(PLUGIN_DIR, f);
+    let mod;
+    try {
+      mod = require(file);
+    } catch (e) {
+      warn(`plugin ${f} failed to load — ${String(e.message).split("\n")[0].slice(0, 120)}`);
+      continue;
+    }
+    const meta = {
+      file,
+      name: String(mod.name || f.replace(/\.(js|cjs)$/, "")),
+      version: String(mod.version || "0.0.0"),
+      description: String(mod.description || ""),
+      usage: String(mod.usage || ""),
+      commands: typeof mod.run === "function" ? 1 : 0,
+      tools: 0,
+    };
+    if (meta.commands) PLUGIN_COMMANDS.set(meta.name, { run: mod.run, usage: meta.usage, description: meta.description, file });
+    for (const tool of Array.isArray(mod.tools) ? mod.tools : []) {
+      if (!tool || !tool.name || typeof tool.execute !== "function") continue;
+      if (typeof tool.name !== "string" || !/^[a-z_][a-z0-9_-]*$/i.test(tool.name)) {
+        warn(`plugin ${f}: tool name "${tool.name}" invalid — skipped`);
+        continue;
+      }
+      PLUGIN_TOOLS.set(tool.name, {
+        execute: tool.execute,
+        mutating: !!tool.mutating,
+        description: String(tool.description || ""),
+        parameters: tool.parameters || {},
+        required: Array.isArray(tool.required) ? tool.required : [],
+        file,
+      });
+      meta.tools++;
+    }
+    if (meta.commands || meta.tools) PLUGINS.push(meta);
+  }
+}
+
 const IGNORE_DIRS = new Set(["node_modules", ".git", "dist", "build", "out", "__pycache__", ".next", "venv", ".venv", ".cache"]);
 
 function loadIgnorePatterns(cwd) {
@@ -629,8 +731,18 @@ async function runTool(name, args, ctx) {
         return capOut(typeof data === "string" ? data : JSON.stringify(data, null, 2), 6000);
       }
 
-      default:
+      default: {
+        // plugin tools (#1 #11) — user-defined agent tools from ~/.gitmancer/plugins
+        const pt = PLUGIN_TOOLS.get(name);
+        if (pt) {
+          if (pt.mutating && !(await allow(`plugin tool \`${name}\` — ${pt.description || "custom tool"}`, ctx))) {
+            return "DENIED by user — do not retry this same tool call; propose an alternative.";
+          }
+          const out = await pt.execute(args, ctx);
+          return capOut(typeof out === "string" ? out : JSON.stringify(out, null, 2), 8000);
+        }
         return `ERROR: unknown tool "${name}"`;
+      }
     }
   } catch (e) {
     return `ERROR: ${e.message}`;
@@ -791,7 +903,8 @@ async function agentTurn(cfg, messages, ctx) {
     let msg;
     let streamed = false;
     try {
-      const r = await aiChat(cfg, messages, TOOLS, {
+      const toolset = PLUGIN_TOOLS.size ? [...TOOLS, ...pluginToolSchemas()] : TOOLS;
+      const r = await aiChat(cfg, messages, toolset, {
         stream: true,
         onDelta: (t) => process.stdout.write(t),
       });
@@ -2405,6 +2518,64 @@ async function cmdDoctor() {
   console.log("");
 }
 
+/* ---------------- plugin management command (#1 #11) ---------------- */
+
+async function cmdPlugin(pos, flags) {
+  const sub = (pos[0] || "list").toLowerCase();
+  if (!(flags.json && sub === "list")) banner();
+  if (sub === "list") {
+    if (flags.json) {
+      return console.log(JSON.stringify({ dir: PLUGIN_DIR, plugins: PLUGINS.map((p) => ({ name: p.name, version: p.version, description: p.description, file: p.file, commands: p.commands, tools: p.tools })) }, null, 2));
+    }
+    if (!PLUGINS.length) {
+      console.log(`no plugins installed in ${dim(PLUGIN_DIR)}\n\nscaffold a starter with:\n  ${cyan(`${NAME} plugin new hello`)}   ${dim("→ command + agent-tool example, ready to edit")}\n`);
+      return;
+    }
+    console.log(`\n${bold(PLUGINS.length + " plugin" + (PLUGINS.length === 1 ? "" : "s") + " loaded")} ${dim("from " + PLUGIN_DIR)}\n`);
+    for (const p of PLUGINS) {
+      const kind = [p.commands ? "command" : null, p.tools ? p.tools + " tool" + (p.tools === 1 ? "" : "s") : null].filter(Boolean).join(" + ");
+      console.log(`  ${bold(cyan(p.name))} ${dim("v" + p.version)}  ${dim(kind)}\n    ${p.description || dim("(no description)")}\n    ${dim(p.file)}`);
+    }
+    console.log("");
+    return;
+  }
+  if (sub === "new" || sub === "add") {
+    const name = String(pos[1] || "").trim();
+    if (!/^[a-z][a-z0-9_-]*$/i.test(name)) throw new UserErr(`plugin name must match [a-z][a-z0-9_-]* — got "${name || "(empty)"}"`);
+    const file = path.join(PLUGIN_DIR, name + ".js");
+    if (fs.existsSync(file) && !flags.force) throw new UserErr(`${file} already exists — use --force to overwrite`);
+    fs.mkdirSync(PLUGIN_DIR, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, PLUGIN_TEMPLATE.replace(/"hello"/g, `"${name}"`).replace(/gitmancer hello/g, `gitmancer ${name}`).replace(/name: "hello"/g, `name: "${name}"`), { mode: 0o600 });
+    ok(`scaffolded ${bold(file)}`);
+    console.log(`
+next steps:
+  1. edit the file — keep ${cyan("run")} for a ${cyan(`${NAME} ${name}`)} command, ${cyan("tools[]")} to give the AI new abilities
+  2. try it:  ${cyan(`${NAME} ${name}`)}   ${dim("(loaded at every startup, no restart daemon needed)")}
+  3. list:    ${cyan(`${NAME} plugin list --json`)}
+`);
+    return;
+  }
+  if (sub === "remove" || sub === "rm" || sub === "uninstall") {
+    const name = String(pos[1] || "").trim();
+    if (!name) throw new UserErr("usage: plugin remove <name|file.js>");
+    const target = PLUGIN_COMMANDS.get(name) || [...PLUGIN_COMMANDS.values()].find((c) => path.basename(c.file) === name) || [...PLUGIN_TOOLS.values()].find((x) => x.file.endsWith(name)) ;
+    const file = target ? target.file : path.join(PLUGIN_DIR, name.endsWith(".js") ? name : name + ".js");
+    if (!fs.existsSync(file)) throw new UserErr(`no plugin file found for "${name}" in ${PLUGIN_DIR}`);
+    if (!flags.yolo) {
+      const ans = ((await askUser(`${yellow("delete")} ${bold(file)} ${dim("[y/N]")} `)) ?? "").trim().toLowerCase();
+      if (ans !== "y" && ans !== "yes") return warn("aborted — nothing deleted");
+    }
+    fs.unlinkSync(file);
+    ok(`removed ${file} — gone from next startup`);
+    return;
+  }
+  if (sub === "path" || sub === "dir") {
+    console.log(PLUGIN_DIR + (fs.existsSync(PLUGIN_DIR) ? "" : dim("  (does not exist yet — plugin new creates it)")));
+    return;
+  }
+  throw new UserErr(`unknown plugin subcommand "${sub}" — try list | new <name> | remove <name> | path`);
+}
+
 /* ---------------- help / arg parsing / main ---------------- */
 
 function help() {
@@ -2462,6 +2633,8 @@ ${bold("COMMANDS")}
                     ${dim('--apply (write labels)  --limit 20  --json  --yolo')}
   ${cyan("hook")} list|install|uninstall [name]
                     ${dim('managed git hooks that run secscan — pre-commit (default) | pre-push | commit-msg  --force')}
+  ${cyan("plugin")} list|new|remove       manage plugins in ~/.gitmancer/plugins — custom commands + AI tools, no fork
+                    ${dim('list [--json] · new <name> [--force] · remove <name> [--yolo] · path')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2491,10 +2664,19 @@ ${bold("EXAMPLES")}
   gitmancer triage me/myrepo --apply     ${dim("# AI-prioritize issues & label them")}
   gitmancer explain HEAD~1..HEAD         ${dim("# what did this change just do?")}
   gitmancer fleet status --root ~/code   ${dim("# every repo under ~/code at a glance")}
+  gitmancer plugin new hello             ${dim("# scaffold a plugin → gitmancer hello just works")}
 `);
+  if (PLUGIN_COMMANDS.size) {
+    console.log(`
+${bold("PLUGINS")} ${dim("(" + PLUGIN_COMMANDS.size + " command" + (PLUGIN_COMMANDS.size === 1 ? "" : "s") + " from ~/.gitmancer/plugins)")}`);
+    for (const [name, p] of PLUGIN_COMMANDS) {
+      console.log(`  ${cyan(name)} ${p.usage ? dim(p.usage) : ""}  ${dim("— " + (p.description || "plugin command"))}`);
+    }
+    console.log("");
+  }
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -2532,6 +2714,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const { cmd, pos, flags } = parseArgs(argv);
   if (flags["no-color"] || process.env.NO_COLOR) FORCE_COLOR_OFF = true;
+  loadPlugins(); // plugin commands + agent tools (#1 #11) — before any dispatch
   if (flags.version || flags.v) return console.log(`${NAME} v${VERSION}`);
   if (flags.help || flags.h) return help();
   if (!cmd || cmd === "help") return help();
@@ -2565,7 +2748,16 @@ async function main() {
     case "fleet": return cmdFleet(pos, flags);
     case "triage": return cmdTriage(pos, flags);
     case "hook": return cmdHook(pos, flags);
+    case "plugin": return cmdPlugin(pos, flags);
     default:
+      // plugin-defined commands (#1 #11) win before the ask-fallback
+      if (PLUGIN_COMMANDS.has(cmd)) {
+        const p = PLUGIN_COMMANDS.get(cmd);
+        const cfg = loadConfig();
+        const out = await p.run({ args: pos, flags, cwd: process.cwd(), cfg, ctx: mkCtx(flags, cfg) });
+        if (out != null) console.log(out);
+        return;
+      }
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
   }

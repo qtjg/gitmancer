@@ -23,6 +23,8 @@ let userHits = 0;
 let retryTrips = 0;
 let cacheAsks = 0;
 let labelPosts = 0;
+let plugCalls = 0;
+let diceInTools = false;
 const failed = [];
 
 function check(name, cond) {
@@ -177,6 +179,14 @@ const server = http.createServer((req, res) => {
       } else if (/hello2/.test(String(lastUser))) {
         // budget flow: always demand a write so the budget check trips on the next step
         message = { role: "assistant", content: null, tool_calls: [{ id: "bud1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "hello2.txt", content: "budget" }) } }] };
+      } else if (/plugin tool test/.test(String(lastUser))) {
+        // plugin flow: 1st call → plugin-defined dice tool, 2nd → final text
+        plugCalls++;
+        diceInTools = diceInTools || (reqBody.tools || []).some((tl) => tl.function && tl.function.name === "dice");
+        message =
+          plugCalls % 2 === 1
+            ? { role: "assistant", content: null, tool_calls: [{ id: "plug_1", type: "function", function: { name: "dice", arguments: JSON.stringify({ sides: 6 }) } }] }
+            : { role: "assistant", content: "Plugin dice rolled — custom tools work end to end." };
       } else if (aiCalls % 2 === 1) {
         // odd call → request a file write (so both yolo and deny scenarios work)
         message = {
@@ -667,6 +677,36 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("uninstall removed the gitmancer-only hook", !fs.existsSync(hp));
   r = await runCli(["hook", "install", "banana"], hkDir, env);
   check("hook rejects unknown hook name", r.status !== 0);
+
+  console.log("→ plugin system (#1 #11): scaffold, command, agent tool, list, remove");
+  const plugHome = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-plug-"));
+  const plugEnv = { ...env, HOME: plugHome };
+  r = await runCli(["plugin", "list"], tmp, plugEnv);
+  check("plugin list empty state exits 0", r.status === 0);
+  check("plugin list suggests scaffold", /plugin new/.test(r.stdout || ""));
+  r = await runCli(["plugin", "new", "hello"], tmp, plugEnv);
+  check("plugin new scaffolds file", r.status === 0 && fs.existsSync(path.join(plugHome, ".gitmancer", "plugins", "hello.js")));
+  r = await runCli(["plugin", "new", "hello"], tmp, plugEnv);
+  check("plugin new refuses overwrite without --force", r.status !== 0);
+  r = await runCli(["hello"], tmp, plugEnv);
+  check("plugin command runs", r.status === 0 && /hello from a plugin/.test(r.stdout || ""));
+  r = await runCli(["hello", "--loud"], tmp, plugEnv);
+  check("plugin command receives flags", /HELLO FROM A PLUGIN/.test(r.stdout || ""));
+  r = await runCli(["help"], tmp, plugEnv);
+  check("help lists PLUGINS section", /PLUGINS/.test(r.stdout || "") && /hello \[--loud\]/.test(r.stdout || ""));
+  r = await runCli(["plugin", "list", "--json"], tmp, plugEnv);
+  let pj = null;
+  try { pj = JSON.parse(r.stdout); } catch {}
+  check("plugin list --json parses", !!pj && Array.isArray(pj.plugins) && pj.plugins.length === 1 && pj.plugins[0].tools === 1);
+  const plugBefore = aiCalls;
+  r = await runCli(["ask", "plugin tool test", "--yolo"], tmp, plugEnv);
+  check("ask with plugin tool exits 0", r.status === 0);
+  check("plugin tool schema reached the AI", diceInTools === true);
+  check("plugin tool executed by agent", /rolled \d+ \(d6\)/.test(r.stdout || ""));
+  check("plugin flow used two AI calls", aiCalls - plugBefore >= 2);
+  r = await runCli(["plugin", "remove", "hello", "--yolo"], tmp, plugEnv);
+  check("plugin remove exits 0", r.status === 0);
+  check("plugin file deleted", !fs.existsSync(path.join(plugHome, ".gitmancer", "plugins", "hello.js")));
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
