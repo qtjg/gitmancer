@@ -593,6 +593,36 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("explain command exits 0", r.status === 0);
   check("explain command answers", /EXPLAIN-OK \(cmd\)/.test(r.stdout || ""));
 
+  console.log("→ fleet: multi-repo status / secscan / run / json");
+  const fleetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-fleet-"));
+  for (const name of ["fleet-a", "fleet-b"]) {
+    const d = path.join(fleetRoot, name);
+    fs.mkdirSync(d, { recursive: true });
+    spawnSync("git", ["init", "-b", "main"], { cwd: d });
+    spawnSync("git", ["config", "user.email", "t@t.local"], { cwd: d });
+    spawnSync("git", ["config", "user.name", "t"], { cwd: d });
+    fs.writeFileSync(path.join(d, "f.txt"), "x\n");
+    spawnSync("git", ["add", "."], { cwd: d });
+    spawnSync("git", ["commit", "-m", "init"], { cwd: d });
+  }
+  const FAKE_PW = "super-secret-pass" + "word-123";
+  fs.writeFileSync(path.join(fleetRoot, "fleet-a", "leak.js"), `const password = "${FAKE_PW}";\n`);
+  spawnSync("git", ["add", "leak.js"], { cwd: path.join(fleetRoot, "fleet-a") });
+  r = await runCli(["fleet", "status", "--root", fleetRoot, "--json"], fleetRoot, env);
+  check("fleet status exits 0", r.status === 0);
+  j = null;
+  try { j = JSON.parse(r.stdout); } catch {}
+  check("fleet status --json lists both repos sorted", Array.isArray(j) && j.map((x) => x.repo).join(",") === "fleet-a,fleet-b");
+  check("fleet status shows branch", !!(j && j[0] && j[0].branch === "main"));
+  r = await runCli(["fleet", "secscan", "--root", fleetRoot], fleetRoot, env);
+  check("fleet secscan exits 1 (finding in fleet-a)", r.status === 1);
+  check("fleet secscan reports both repos", /fleet-a/.test(r.stdout || "") && /fleet-b/.test(r.stdout || ""));
+  r = await runCli(["fleet", "run", "echo hi", "--root", fleetRoot], fleetRoot, env);
+  check("fleet run exits 0", r.status === 0);
+  check("fleet run executed per repo", (r.stdout || "").split("hi").length - 1 >= 2);
+  r = await runCli(["fleet", "banana", "--root", fleetRoot], fleetRoot, env);
+  check("fleet rejects unknown action", r.status !== 0);
+
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
   if (failed.length) {

@@ -1994,6 +1994,95 @@ async function cmdExplain(pos, flags) {
   console.log(text);
 }
 
+/* ---------------- fleet: run one action across every repo under a root ---------------- */
+
+function fleetDiscover(root) {
+  const repos = [];
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    if (!entry.isDirectory() || entry.name.startsWith(".")) continue;
+    const dir = path.join(root, entry.name);
+    if (fs.existsSync(path.join(dir, ".git"))) repos.push(dir);
+  }
+  return repos.sort();
+}
+
+function repoBrief(dir) {
+  const brief = { branch: null, dirty: 0, ahead: 0, behind: 0, lastCommit: null };
+  try {
+    const lines = gitOut(["status", "-sb", "--porcelain"], dir).split("\n").filter(Boolean);
+    const m = /^## ([^.\s]+)(?:\.\.\.[^\s]+)?(?:\s+\[(?:ahead (\d+))?(?:, ?)?(?:behind (\d+))?\])?/.exec(lines[0] || "");
+    if (m) {
+      brief.branch = m[1];
+      brief.ahead = m[2] ? Number(m[2]) : 0;
+      brief.behind = m[3] ? Number(m[3]) : 0;
+    }
+    brief.dirty = Math.max(0, lines.length - 1);
+    try {
+      brief.lastCommit = gitOut(["log", "--oneline", "-1"], dir);
+    } catch {}
+  } catch {}
+  return brief;
+}
+
+async function cmdFleet(pos, flags) {
+  if (!flags.json) banner();
+  const action = pos[0] || "status";
+  const root = path.resolve((typeof flags.root === "string" && flags.root) || process.cwd());
+  if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) throw new UserErr(`--root is not a directory: ${root}`);
+  if (!["status", "pull", "secscan", "run"].includes(action)) {
+    throw new UserErr(`unknown fleet action: ${action} (use status | pull | secscan | run "<cmd>")`);
+  }
+  const cmdStr = action === "run" ? pos.slice(1).join(" ").trim() : "";
+  if (action === "run" && !cmdStr) throw new UserErr('fleet run needs a command: gitmancer fleet run "npm test"');
+  const repos = fleetDiscover(root);
+  if (!repos.length) throw new UserErr(`no git repositories directly under ${root}`);
+  if (!flags.json) console.log(dim(`${repos.length} repo(s) under ${root} — action: ${action}\n`));
+  const rows = [];
+  for (const dir of repos) {
+    const row = { repo: path.basename(dir), status: "ok", detail: "" };
+    try {
+      if (action === "status") {
+        const b = repoBrief(dir);
+        row.branch = b.branch;
+        row.dirty = b.dirty;
+        row.ahead = b.ahead;
+        row.behind = b.behind;
+        row.lastCommit = b.lastCommit;
+        row.detail = `${b.branch || "?"}${b.dirty ? ` · ${b.dirty} dirty` : ""}${b.ahead ? ` · ↑${b.ahead}` : ""}${b.behind ? ` · ↓${b.behind}` : ""}`;
+      } else if (action === "pull") {
+        const r = runShell("git pull --ff-only", dir, 120000);
+        row.status = r.code === 0 ? "ok" : "fail";
+        row.detail = r.code === 0 ? (/Already up to date/i.test(r.out) ? "up to date" : "fast-forwarded") : capOut(r.out, 160);
+      } else if (action === "secscan") {
+        const res = scanRepoForSecrets(dir, {});
+        row.findings = res.findings.length;
+        row.scanned = res.scanned;
+        row.detail = `${res.findings.length} finding(s) across ${res.scanned} file(s)`;
+        if (res.findings.length) row.status = "fail";
+      } else {
+        const r = runShell(cmdStr, dir, 300000);
+        row.status = r.code === 0 ? "ok" : "fail";
+        row.code = r.code;
+        row.detail = capOut(r.out, 200);
+      }
+    } catch (e) {
+      row.status = "fail";
+      row.detail = String(e.message).split("\n")[0];
+    }
+    rows.push(row);
+  }
+  if (flags.json) return console.log(JSON.stringify(rows, null, 2));
+  for (const row of rows) {
+    const mark = row.status === "ok" ? green("✔") : red("✖");
+    console.log(`  ${mark} ${bold(row.repo)}  ${dim(row.detail)}`);
+  }
+  const bad = rows.filter((r) => r.status !== "ok").length;
+  if (bad) {
+    fail(`${bad}/${rows.length} repo(s) failed ${action}`);
+    process.exitCode = 1;
+  } else ok(`all ${rows.length} repo(s) ${action} ok`);
+}
+
 /* ---------------- review: AI code review of a pull request ---------------- */
 
 async function cmdReview(pos, flags) {
@@ -2230,6 +2319,8 @@ ${bold("COMMANDS")}
                     ${dim('--write  --yolo  --fast')}
   ${cyan("explain")} <target>      AI explains a file, a git rev/range, or a shell command
                     ${dim('explain app.js · explain HEAD~1..HEAD · explain "git rebase --onto"')}
+  ${cyan("fleet")} <action>        run one action across every repo directly under --root
+                    ${dim('status | pull | secscan | run "<cmd>"   --root <dir>  --json')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2327,6 +2418,7 @@ async function main() {
     case "secscan": return cmdSecscan(pos, flags);
     case "testgen": return cmdTestgen(pos, flags);
     case "explain": return cmdExplain(pos, flags);
+    case "fleet": return cmdFleet(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
