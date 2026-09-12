@@ -708,6 +708,77 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("plugin remove exits 0", r.status === 0);
   check("plugin file deleted", !fs.existsSync(path.join(plugHome, ".gitmancer", "plugins", "hello.js")));
 
+  console.log("→ MCP server mode (#2 #10): initialize, tools/list, tools/call over stdio JSON-RPC");
+  {
+    const mcpDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-mcp-"));
+    spawnSync("git", ["init", "-b", "main"], { cwd: mcpDir });
+    spawnSync("git", ["config", "user.email", "t@t.local"], { cwd: mcpDir });
+    spawnSync("git", ["config", "user.name", "t"], { cwd: mcpDir });
+    const FAKE_MCP = "ghp_" + "M".repeat(32) + "2222";
+    fs.writeFileSync(path.join(mcpDir, "note.txt"), "hello from mcp\n");
+    fs.writeFileSync(path.join(mcpDir, "leak.js"), `const t = "${FAKE_MCP}";\n`);
+    spawnSync("git", ["add", "."], { cwd: mcpDir });
+    const child = spawn(process.execPath, [CLI, "mcp"], { cwd: mcpDir, env, stdio: ["pipe", "pipe", "pipe"] });
+    const lineQ = [];
+    let lineWait = null;
+    let mbuf = "";
+    child.stdout.on("data", (d) => {
+      mbuf += d.toString();
+      let idx;
+      while ((idx = mbuf.indexOf("\n")) !== -1) {
+        const out = mbuf.slice(0, idx);
+        mbuf = mbuf.slice(idx + 1);
+        if (lineWait) {
+          const r = lineWait;
+          lineWait = null;
+          r(out);
+        } else lineQ.push(out);
+      }
+    });
+    const nextLine = () => (lineQ.length ? Promise.resolve(lineQ.shift()) : new Promise((res) => (lineWait = res)));
+    const rpc = (obj) => child.stdin.write(JSON.stringify(obj) + "\n");
+    let m;
+    rpc({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} });
+    m = JSON.parse(await nextLine());
+    check("mcp initialize returns protocol + serverInfo", m.result && m.result.protocolVersion === "2024-11-05" && m.result.serverInfo.name === "gitmancer");
+    rpc({ jsonrpc: "2.0", method: "notifications/initialized" });
+    rpc({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+    m = JSON.parse(await nextLine());
+    const mcpNames = (m.result.tools || []).map((x) => x.name);
+    check("mcp tools/list exposes 5 tools", mcpNames.length === 5);
+    check("mcp tools/list has schemas", m.result.tools.every((x) => x.inputSchema && x.inputSchema.type === "object"));
+    rpc({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "list_files", arguments: { path: "." } } });
+    m = JSON.parse(await nextLine());
+    check("mcp list_files works", m.result && m.result.content[0].text.includes("note.txt"));
+    rpc({ jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "run_cmd", arguments: { command: "echo mcp-ok" } } });
+    m = JSON.parse(await nextLine());
+    check("mcp read-only run_cmd allowed", m.result && !m.result.isError && /mcp-ok/.test(m.result.content[0].text));
+    rpc({ jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "run_cmd", arguments: { command: "rm note.txt" } } });
+    m = JSON.parse(await nextLine());
+    check("mcp mutating run_cmd refused by default", m.result && m.result.isError && /GITMANCER_MCP_ALLOW_RUN/.test(m.result.content[0].text));
+    rpc({ jsonrpc: "2.0", id: 6, method: "tools/call", params: { name: "secscan", arguments: {} } });
+    m = JSON.parse(await nextLine());
+    let scan = null;
+    try { scan = JSON.parse(m.result.content[0].text); } catch {}
+    check("mcp secscan finds planted secret", scan && scan.findings && scan.findings.length >= 1);
+    check("mcp secscan redacts secret value", scan && !JSON.stringify(scan).includes(FAKE_MCP));
+    rpc({ jsonrpc: "2.0", id: 7, method: "tools/call", params: { name: "read_file", arguments: { path: "note.txt" } } });
+    m = JSON.parse(await nextLine());
+    check("mcp read_file works", m.result && /hello from mcp/.test(m.result.content[0].text));
+    rpc({ jsonrpc: "2.0", id: 8, method: "no/such/method" });
+    m = JSON.parse(await nextLine());
+    check("mcp unknown method → -32601", m.error && m.error.code === -32601);
+    rpc({ jsonrpc: "2.0", id: 9, method: "tools/call", params: { name: "banana", arguments: {} } });
+    m = JSON.parse(await nextLine());
+    check("mcp unknown tool → -32602", m.error && m.error.code === -32602);
+    rpc({ jsonrpc: "2.0", id: 10, method: "tools/call", params: { name: "repo_status", arguments: {} } });
+    m = JSON.parse(await nextLine());
+    check("mcp repo_status shows branch", m.result && !m.result.isError && /branch: main/.test(m.result.content[0].text));
+    child.stdin.end();
+    await new Promise((res) => child.once("exit", res));
+    check("mcp exits cleanly on stdin close", true);
+  }
+
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
   if (failed.length) {

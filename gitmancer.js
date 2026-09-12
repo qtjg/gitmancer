@@ -2576,6 +2576,152 @@ next steps:
   throw new UserErr(`unknown plugin subcommand "${sub}" — try list | new <name> | remove <name> | path`);
 }
 
+/* ---------------- MCP server mode (#2 #10): gitmancer tools over stdio JSON-RPC ----------------
+ *
+ * `gitmancer mcp` speaks the Model Context Protocol (newline-delimited JSON-RPC 2.0
+ * on stdio) so IDEs and other agents can use gitmancer's tools directly.
+ * Protocol purity: nothing but JSON-RPC responses go to stdout — diagnostics → stderr.
+ * Default exposure is read-only; run_cmd allows known read-only commands and refuses
+ * everything else unless GITMANCER_MCP_ALLOW_RUN=1.
+ */
+
+const MCP_PROTOCOL_VERSION = "2024-11-05";
+
+const MCP_TOOLS = [
+  {
+    name: "repo_status",
+    description: "Git snapshot of the workspace: branch, ahead/behind vs upstream, last commit, dirty files (porcelain).",
+    inputSchema: { type: "object", properties: {}, required: [] },
+    run: async (_args, cwd) => {
+      const one = (args) => gitOut(args, cwd);
+      let branch = "(unknown)";
+      try {
+        branch = one(["rev-parse", "--abbrev-ref", "HEAD"]);
+      } catch {
+        try {
+          branch = one(["symbolic-ref", "--short", "HEAD"]); // unborn branch (no commits yet)
+        } catch {}
+      }
+      let last = "(no commits yet)";
+      try {
+        last = one(["log", "--oneline", "-1"]);
+      } catch {}
+      const dirty = one(["status", "--porcelain"]).split("\n").filter(Boolean);
+      let ahead = "?";
+      let behind = "?";
+      try {
+        const ab = one(["rev-list", "--left-right", "--count", "HEAD...@{upstream}"]).split(/\s+/);
+        if (ab.length === 2) [ahead, behind] = ab;
+      } catch {}
+      return `branch: ${branch}\nahead/behind: ${ahead}/${behind}\nlast commit: ${last}\ndirty files (${dirty.length}):\n${dirty.map((d) => "  " + d).join("\n") || "  (clean)"}`;
+    },
+  },
+  {
+    name: "list_files",
+    description: "List files and folders under a workspace path (respects .gitignore, depth-capped).",
+    inputSchema: { type: "object", properties: { path: { type: "string", description: "Relative path (default '.')" } }, required: [] },
+    run: async (args, cwd) => toolListFiles(cwd, args.path || "."),
+  },
+  {
+    name: "read_file",
+    description: "Read a text file from the workspace (offset/limit paging, capped at 2000 lines / 20k chars).",
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string" }, offset: { type: "number", description: "1-based first line" }, limit: { type: "number", description: "max lines" } },
+      required: ["path"],
+    },
+    run: async (args, cwd) => {
+      const abs = safePath(cwd, args.path);
+      const raw = capOut(fs.readFileSync(abs, "utf8"), 20000);
+      const lines = raw.split("\n");
+      const off = Math.max(parseInt(args.offset, 10) || 1, 1);
+      const lim = Math.min(Math.max(parseInt(args.limit, 10) || 2000, 1), 2000);
+      const slice = lines.slice(off - 1, off - 1 + lim);
+      return slice.length === lines.length && off === 1 ? raw : `[lines ${off}-${off - 1 + slice.length} of ${lines.length}]\n` + slice.join("\n");
+    },
+  },
+  {
+    name: "run_cmd",
+    description:
+      "Run a shell command in the workspace and get combined stdout+stderr. Known read-only commands (ls/cat/git status/…) always allowed; anything else is refused unless GITMANCER_MCP_ALLOW_RUN=1.",
+    inputSchema: {
+      type: "object",
+      properties: { command: { type: "string" }, timeout_ms: { type: "number", description: "default 120000, max 600000" } },
+      required: ["command"],
+    },
+    run: async (args, cwd) => {
+      const command = String(args.command || "").trim();
+      if (!command) throw new UserErr("empty command");
+      if (!SAFE_CMD_RE.test(command) && process.env.GITMANCER_MCP_ALLOW_RUN !== "1") {
+        throw new UserErr('refused: not a known read-only command — set GITMANCER_MCP_ALLOW_RUN=1 to lift the MCP run-gate');
+      }
+      const r = runShell(command, cwd, Math.min(Math.max(parseInt(args.timeout_ms, 10) || 120000, 1000), 600000));
+      return `exit ${r.code}\n${r.out || "(no output)"}`;
+    },
+  },
+  {
+    name: "secscan",
+    description: "Scan tracked files (or the staged diff) for API keys & secrets. Returns JSON: findings, scanned, skipped.",
+    inputSchema: { type: "object", properties: { staged: { type: "boolean", description: "scan staged diff only" }, path: { type: "string", description: "single file" } }, required: [] },
+    run: async (args, cwd) => JSON.stringify(scanRepoForSecrets(cwd, { staged: !!args.staged, path: typeof args.path === "string" ? args.path : undefined }), null, 2),
+  },
+];
+
+async function cmdMcp() {
+  const cwd = process.cwd();
+  const send = (obj) => process.stdout.write(JSON.stringify(obj) + "\n");
+  const wire = readline.createInterface({ input: process.stdin, terminal: false });
+  const handle = async (msg) => {
+    if (!msg || typeof msg !== "object" || typeof msg.method !== "string") return;
+    const isNotif = msg.id === undefined || msg.id === null;
+    const reply = (result, error) => {
+      if (isNotif) return;
+      send(error ? { jsonrpc: "2.0", id: msg.id, error } : { jsonrpc: "2.0", id: msg.id, result });
+    };
+    switch (msg.method) {
+      case "initialize":
+        return reply({ protocolVersion: MCP_PROTOCOL_VERSION, capabilities: { tools: {} }, serverInfo: { name: NAME, version: VERSION } });
+      case "notifications/initialized":
+      case "notifications/cancelled":
+        return;
+      case "ping":
+        return reply({});
+      case "tools/list":
+        return reply({ tools: MCP_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) });
+      case "tools/call": {
+        const name = msg.params && msg.params.name;
+        const args = (msg.params && msg.params.arguments) || {};
+        const tool = MCP_TOOLS.find((x) => x.name === name);
+        if (!tool) return reply(undefined, { code: -32602, message: `unknown tool: ${name}` });
+        try {
+          const text = await tool.run(args, cwd);
+          return reply({ content: [{ type: "text", text: capOut(String(text), 20000) }], isError: false });
+        } catch (e) {
+          return reply({ content: [{ type: "text", text: `ERROR: ${e.message}` }], isError: true });
+        }
+      }
+      default:
+        return reply(undefined, { code: -32601, message: `method not found: ${msg.method}` });
+    }
+  };
+  process.stderr.write(`${NAME} MCP server on stdio — cwd ${cwd} · ${MCP_TOOLS.length} tools · protocol ${MCP_PROTOCOL_VERSION}\n`);
+  wire.on("line", (line) => {
+    const s = line.trim();
+    if (!s) return;
+    let msg;
+    try {
+      msg = JSON.parse(s);
+    } catch {
+      return send({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+    }
+    handle(msg).catch((e) =>
+      send({ jsonrpc: "2.0", id: msg && msg.id !== undefined ? msg.id : null, error: { code: -32603, message: String((e && e.message) || e).slice(0, 300) } })
+    );
+  });
+  // keep main() pending while the server runs — main resolves only on stdin close
+  await new Promise((resolve) => wire.on("close", resolve));
+}
+
 /* ---------------- help / arg parsing / main ---------------- */
 
 function help() {
@@ -2635,6 +2781,8 @@ ${bold("COMMANDS")}
                     ${dim('managed git hooks that run secscan — pre-commit (default) | pre-push | commit-msg  --force')}
   ${cyan("plugin")} list|new|remove       manage plugins in ~/.gitmancer/plugins — custom commands + AI tools, no fork
                     ${dim('list [--json] · new <name> [--force] · remove <name> [--yolo] · path')}
+  ${cyan("mcp")}                   run as an MCP server (stdio JSON-RPC) — expose gitmancer tools to IDEs & agents
+                    ${dim('read-only by default · GITMANCER_MCP_ALLOW_RUN=1 lifts the run gate')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2749,6 +2897,8 @@ async function main() {
     case "triage": return cmdTriage(pos, flags);
     case "hook": return cmdHook(pos, flags);
     case "plugin": return cmdPlugin(pos, flags);
+    case "mcp":
+    case "mcp-server": return cmdMcp(pos, flags);
     default:
       // plugin-defined commands (#1 #11) win before the ask-fallback
       if (PLUGIN_COMMANDS.has(cmd)) {
