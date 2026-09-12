@@ -191,6 +191,10 @@ const server = http.createServer((req, res) => {
           plugCalls % 2 === 1
             ? { role: "assistant", content: null, tool_calls: [{ id: "plug_1", type: "function", function: { name: "dice", arguments: JSON.stringify({ sides: 6 }) } }] }
             : { role: "assistant", content: "Plugin dice rolled — custom tools work end to end." };
+      } else if (/resume probe/.test(String(lastUser))) {
+        // resume flow: answer depends on how much history arrived
+        const mlen = (reqBody.messages || []).length;
+        message = { role: "assistant", content: mlen > 3 ? "RESUMED-OK — context remembered." : "fresh session — no memory yet." };
       } else if (/^\[gitmancer plan\]/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
         // plan flow: deterministic JSON plan with one shell step + one agent step
         message = {
@@ -920,6 +924,27 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
     check("usage --reset clears the log", r.status === 0 && fs.readFileSync(ulog, "utf8").trim() === "");
     r = await runCli(["usage"], tmp, useEnv);
     check("usage empty state honest", r.status === 0 && /no AI usage recorded/.test(r.stdout || ""));
+  }
+
+  console.log("→ chat session persistence (#9): --chat saves, --resume restores");
+  {
+    const chatHome = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-chat-"));
+    const chatEnv = { ...env, HOME: chatHome };
+    r = await runCli(["ask", "resume probe", "--chat"], tmp, chatEnv, 30000, "/exit\n");
+    check("chat session run exits 0", r.status === 0);
+    check("chat prints session id + resume hint", /chat session \w+ started/.test(r.stdout || "") && /--resume/.test(r.stdout || ""));
+    const chatDir = path.join(chatHome, ".gitmancer", "sessions", "chat");
+    const sessions = fs.existsSync(chatDir) ? fs.readdirSync(chatDir).filter((f) => f.endsWith(".json")) : [];
+    check("chat session saved to disk", sessions.length === 1);
+    let sess = null;
+    if (sessions.length) sess = JSON.parse(fs.readFileSync(path.join(chatDir, sessions[0]), "utf8"));
+    check("saved session has turns[] with the user task", !!sess && Array.isArray(sess.turns) && sess.turns.some((m) => /resume probe/.test(String(m.content || ""))));
+    r = await runCli(["ask", "--resume", "last"], tmp, chatEnv, 30000, "/exit\n");
+    check("--resume last restores the session", r.status === 0 && /resumed chat session/.test(r.stdout || ""));
+    r = await runCli(["ask", "resume probe", "--resume", "last"], tmp, chatEnv, 30000, "/exit\n");
+    check("resumed context reaches the model (memory answer)", r.status === 0 && /RESUMED-OK/.test(r.stdout || ""));
+    r = await runCli(["ask", "--resume", "no-such-session-xyz"], tmp, chatEnv);
+    check("--resume of missing id fails cleanly", r.status !== 0 && /not found/.test((r.stderr || "") + (r.stdout || "")));
   }
 
   server.close();

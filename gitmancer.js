@@ -1183,6 +1183,50 @@ async function cmdRepos(flags) {
   console.log("");
 }
 
+/* ---------------- chat session persistence (#9) ---------------- */
+
+function chatSessionsDir() {
+  return path.join(sessionsDir(), "chat");
+}
+
+function saveChatSession(id, messages, cwd, model) {
+  try {
+    fs.mkdirSync(chatSessionsDir(), { recursive: true, mode: 0o700 });
+    const file = path.join(chatSessionsDir(), id + ".json");
+    const prev = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ id, started: prev.started || new Date().toISOString(), updated: new Date().toISOString(), cwd, model, turns: messages.slice(1) }, null, 2),
+      { mode: 0o600 }
+    );
+    return file;
+  } catch {
+    return null;
+  }
+}
+
+function loadChatSession(id) {
+  const file = id === "last" || id === true
+    ? (() => {
+        const files = fs.existsSync(chatSessionsDir()) ? fs.readdirSync(chatSessionsDir()).filter((f) => f.endsWith(".json")) : [];
+        if (!files.length) throw new UserErr("no saved chat sessions yet — start one with: gitmancer ask --chat");
+        files.sort((a, b) => fs.statSync(path.join(chatSessionsDir(), b)).mtimeMs - fs.statSync(path.join(chatSessionsDir(), a)).mtimeMs);
+        return path.join(chatSessionsDir(), files[0]);
+      })()
+    : (() => {
+        const f = path.join(chatSessionsDir(), String(id).endsWith(".json") ? String(id) : String(id) + ".json");
+        if (!fs.existsSync(f)) throw new UserErr(`chat session not found: ${id} (list them: ls ~/.gitmancer/sessions/chat/)`);
+        return f;
+      })();
+  try {
+    const j = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!Array.isArray(j.turns)) throw new Error("no turns[]");
+    return j;
+  } catch (e) {
+    throw new UserErr(`chat session unreadable (${String(e.message).split("\n")[0]})`);
+  }
+}
+
 async function cmdAsk(pos, flags) {
   const cfg = loadTuned(flags);
   if (cfg.__fast) console.log(dim(`fast mode → ${cfg.aiModel}`));
@@ -1190,6 +1234,14 @@ async function cmdAsk(pos, flags) {
   const sys = systemPrompt(ctx);
   const messages = [{ role: "system", content: sys }];
   banner();
+  let sessionId = null;
+  if (flags.resume) {
+    const s = loadChatSession(flags.resume);
+    sessionId = s.id;
+    messages.push(...s.turns);
+    console.log(green(`✔ resumed chat session ${bold(sessionId)} — ${s.turns.length} saved message(s) from ${String(s.updated || "").slice(0, 16).replace("T", " ")}`));
+    console.log(dim(`model now: ${cfg.aiModel} · context is fresh ${ctx.cwd !== s.cwd ? "(cwd changed: " + s.cwd + ")" : ""}\n`));
+  }
   const task = pos.join(" ").trim();
   if (task) {
     const prompted = flags.verify
@@ -1203,6 +1255,11 @@ async function cmdAsk(pos, flags) {
     }
   }
   console.log(dim("interactive mode — /yolo toggles auto-approve, /clear resets, /exit quits\n"));
+  if (!sessionId) {
+    sessionId = Date.now().toString(36) + Math.random().toString(36).slice(2, 5);
+    console.log(dim(`chat session ${sessionId} started — /exit any time, resume later with: ${NAME} ask --resume ${sessionId}\n`));
+    saveChatSession(sessionId, messages, ctx.cwd, cfg.aiModel);
+  }
   for (;;) {
     let line;
     try {
@@ -1223,11 +1280,13 @@ async function cmdAsk(pos, flags) {
       messages.length = 0;
       messages.push({ role: "system", content: sys });
       ok("context cleared");
+      saveChatSession(sessionId, messages, ctx.cwd, cfg.aiModel);
       continue;
     }
     messages.push({ role: "user", content: t2 });
     trimHistory(messages);
     await agentTurn(cfg, messages, ctx);
+    saveChatSession(sessionId, messages, ctx.cwd, cfg.aiModel);
   }
   console.log(dim("\nbye ⚡"));
 }
@@ -3266,7 +3325,7 @@ ${bold("COMMANDS")}
   ${cyan("whoami")}                 verify GitHub token — who are you on GitHub? ${dim("--json")}
   ${cyan("repos")}                  list your repositories           ${dim('--limit 50  --json')}
   ${cyan('ask')} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
-                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>  --budget 200000')}
+                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>  --budget 200000  --resume <id|last>')}
   ${cyan('fix')} "<cmd>"            run a command; if it fails, the agent auto-fixes the code & re-verifies
                     ${dim('--yolo  --fast  --cwd <dir>')}
   ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
