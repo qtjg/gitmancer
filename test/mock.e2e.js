@@ -187,6 +187,13 @@ const server = http.createServer((req, res) => {
           plugCalls % 2 === 1
             ? { role: "assistant", content: null, tool_calls: [{ id: "plug_1", type: "function", function: { name: "dice", arguments: JSON.stringify({ sides: 6 }) } }] }
             : { role: "assistant", content: "Plugin dice rolled — custom tools work end to end." };
+      } else if (/^\[gitmancer plan\]/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
+        // plan flow: deterministic JSON plan with one shell step + one agent step
+        message = {
+          role: "assistant",
+          content:
+            'Here is the plan:\n```json\n{"title":"Demo plan","steps":[{"title":"write the marker","detail":"echo a marker file","cmd":"echo plan-step-ok > plan-step.txt"},{"title":"verify","detail":"cat the marker file","cmd":"cat plan-step.txt"}]}\n```',
+        };
       } else if (aiCalls % 2 === 1) {
         // odd call → request a file write (so both yolo and deny scenarios work)
         message = {
@@ -841,6 +848,25 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
     check("record without command fails", r.status !== 0);
     r = await runCli(["replay", "definitely-missing-xyz"], tmp, recEnv);
     check("replay of missing session fails cleanly", r.status !== 0 && /not found/.test((r.stderr || "") + (r.stdout || "")));
+  }
+
+  console.log("→ plan / execute (#6): AI plan → saved JSON → executed steps");
+  {
+    const planDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-plan-"));
+    r = await runCli(["plan", "write and verify a marker file", "--write", "plan.json"], planDir, env);
+    check("plan exits 0", r.status === 0);
+    check("plan renders steps", /PLAN: Demo plan/.test(r.stdout || "") && /write the marker/.test(r.stdout || ""));
+    check("plan saved to plan.json", fs.existsSync(path.join(planDir, "plan.json")));
+    r = await runCli(["execute", "plan.json", "--dry-run"], planDir, env);
+    check("execute --dry-run skips everything", r.status === 0 && /dry run — skipped/.test(r.stdout || "") && !fs.existsSync(path.join(planDir, "plan-step.txt")));
+    r = await runCli(["execute", "plan.json", "--yolo"], planDir, env);
+    check("execute runs shell steps", r.status === 0 && /step 1 done/.test(r.stdout || "") && /all green/.test(r.stdout || ""));
+    check("execute produced the step's file", fs.existsSync(path.join(planDir, "plan-step.txt")) && fs.readFileSync(path.join(planDir, "plan-step.txt"), "utf8").trim() === "plan-step-ok");
+    r = await runCli(["execute", "missing-plan.json"], planDir, env);
+    check("execute of missing plan fails cleanly", r.status !== 0 && /not found/.test((r.stderr || "") + (r.stdout || "")));
+    fs.writeFileSync(path.join(planDir, "bad.json"), "{not json");
+    r = await runCli(["execute", "bad.json"], planDir, env);
+    check("execute of invalid JSON fails cleanly", r.status !== 0 && /bad plan JSON/.test((r.stderr || "") + (r.stdout || "")));
   }
 
   server.close();

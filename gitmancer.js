@@ -2772,6 +2772,135 @@ async function cmdReplay(pos, flags) {
   }
 }
 
+/* ---------------- plan / execute (#6): plan-then-execute orchestration ---------------- */
+
+function extractJson(text) {
+  let s = String(text || "").trim();
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (fence) s = fence[1].trim();
+  const start = s.search(/[[{]/);
+  if (start === -1) throw new UserErr("no JSON found in AI reply");
+  s = s.slice(start);
+  const lastBrace = Math.max(s.lastIndexOf("}"), s.lastIndexOf("]"));
+  if (lastBrace !== -1) s = s.slice(0, lastBrace + 1);
+  return JSON.parse(s);
+}
+
+async function cmdPlan(pos, flags) {
+  const task = pos.join(" ").trim();
+  if (!task) throw new UserErr(`usage: ${NAME} plan "<goal>" --write plan.json — AI drafts a step-by-step plan you can execute`);
+  const cfg = applyFast(loadConfig(), flags);
+  const ctx = mkCtx(flags, cfg);
+  const sys = [
+    "You are gitmancer's planning module. Break the user's goal into concrete, ordered steps.",
+    'Reply with ONLY a JSON object: {"title": string, "steps": [{"title": string, "detail": string, "cmd": string}]}',
+    '"cmd" is optional: one shell command that fulfills the step. "detail" explains what/why. Steps must be small, verifiable, ordered. Max 12.',
+    ctx.snapshot ? "WORKSPACE SNAPSHOT:\n" + ctx.snapshot : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  banner();
+  const r = await aiChat(cfg, [{ role: "system", content: "[gitmancer plan]\n" + sys }, { role: "user", content: task }], null, {});
+  let plan;
+  try {
+    plan = extractJson(r.message && r.message.content);
+  } catch (e) {
+    throw new UserErr(`AI reply was not a valid plan (${e.message}) — rephrase and retry`);
+  }
+  if (!plan || !Array.isArray(plan.steps) || !plan.steps.length) throw new UserErr("AI plan contained no steps[] — try a more concrete goal");
+  plan.steps = plan.steps.slice(0, 12).map((s, i) => ({
+    step: i + 1,
+    title: String((s && s.title) || `step ${i + 1}`),
+    detail: String((s && s.detail) || ""),
+    cmd: s && s.cmd ? String(s.cmd) : null,
+  }));
+  plan.task = task;
+  plan.created = new Date().toISOString();
+  const file = flags.write ? path.resolve(String(flags.write === true ? "plan.json" : flags.write)) : null;
+  if (file) {
+    fs.writeFileSync(file, JSON.stringify(plan, null, 2) + "\n");
+    ok(`plan saved → ${file}`);
+  }
+  if (flags.json && !file) return console.log(JSON.stringify(plan, null, 2));
+  console.log(`\n${bold("PLAN: " + (plan.title || task))} — ${plan.steps.length} step(s)\n`);
+  for (const s of plan.steps) {
+    console.log(`  ${cyan(s.step + ".")} ${bold(s.title)}`);
+    if (s.detail) console.log(dim("     " + capOut(s.detail, 160).replace(/\n/g, "\n     ")));
+    if (s.cmd) console.log(`     ${magenta("$")} ${dim(capOut(s.cmd, 120))}`);
+  }
+  console.log(dim(`\nrun it:  ${NAME} execute ${file || "plan.json"}${cfg.__fast ? " --fast" : ""}   ${flags.write ? "" : "(save first with --write plan.json)"}`));
+  if (!file && !flags.json) console.log(dim(`tip: re-run with --write plan.json to save it\n`));
+}
+
+async function cmdExecute(pos, flags) {
+  const file = String(pos[0] || "plan.json");
+  if (!fs.existsSync(file)) throw new UserErr(`plan file not found: ${file} — create one with ${NAME} plan "<goal>" --write plan.json`);
+  let plan;
+  try {
+    plan = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    throw new UserErr(`bad plan JSON (${e.message})`);
+  }
+  if (!Array.isArray(plan.steps) || !plan.steps.length) throw new UserErr("plan has no steps[]");
+  const from = Math.max(parseInt(flags.from, 10) || 1, 1);
+  const only = flags.only ? String(flags.only).split(",").map((n) => parseInt(n, 10)).filter(Boolean) : null;
+  banner();
+  console.log(`\n${bold("EXECUTE: " + (plan.title || file))}${flags["dry-run"] ? yellow("  (dry run — nothing will run)") : ""}\n`);
+  const cfg = applyFast(loadConfig(), flags);
+  const results = [];
+  let failed = 0;
+  for (const raw of plan.steps) {
+    const s = { step: raw.step || plan.steps.indexOf(raw) + 1, title: String(raw.title || "step"), detail: String(raw.detail || ""), cmd: raw.cmd ? String(raw.cmd) : null };
+    if (only && !only.includes(s.step)) continue;
+    if (s.step < from) continue;
+    console.log(`\n${cyan("▸ step " + s.step)} ${bold(s.title)}${s.cmd ? dim("  [$ " + capOut(s.cmd, 90) + "]") : dim("  [agent task]")}`);
+    if (flags["dry-run"]) {
+      console.log(dim("  (dry run — skipped)"));
+      results.push({ step: s.step, ok: null });
+      continue;
+    }
+    if (s.cmd) {
+      const gate = { yolo: !!flags.yolo, always: { value: false } };
+      if (!(await allow(`plan step ${s.step}: run \`${capOut(s.cmd, 100)}\``, gate))) {
+        results.push({ step: s.step, ok: false, why: "denied" });
+        failed++;
+        console.log(red("  ✖ denied — stopping"));
+        break;
+      }
+      const r = runShell(s.cmd, process.cwd(), 300000);
+      console.log(dim(capOut(r.out || "(no output)", 900)));
+      const okStep = r.code === 0;
+      results.push({ step: s.step, ok: okStep, exit: r.code });
+      if (!okStep) {
+        failed++;
+        console.log(red(`  ✖ step ${s.step} failed (exit ${r.code})`));
+        if (!flags["keep-going"]) break;
+      } else ok(`step ${s.step} done`);
+    } else {
+      const ctx = mkCtx(flags, cfg);
+      const messages = [
+        {
+          role: "system",
+          content: systemPrompt(ctx) + `\nYou are executing ONE step of a larger plan (${plan.title || "plan"}). Complete exactly this step, then give a SHORT summary.`,
+        },
+        { role: "user", content: `Step ${s.step}: ${s.title}\n${s.detail}` },
+      ];
+      const how = await agentTurn(cfg, messages, ctx);
+      const okStep = how === "done";
+      results.push({ step: s.step, ok: okStep, how });
+      if (!okStep) {
+        failed++;
+        console.log(red(`  ✖ step ${s.step} did not complete (${how})`));
+        if (!flags["keep-going"]) break;
+      } else ok(`step ${s.step} done`);
+    }
+  }
+  const done = results.filter((r) => r.ok === true).length;
+  console.log(`\n${bold("SUMMARY")}: ${done}/${results.length} step(s) succeeded${failed ? red(` · ${failed} failed`) : green(" · all green ⚡")}`);
+  if (flags.json) console.log(JSON.stringify(results, null, 2));
+  if (failed) process.exitCode = 1;
+}
+
 /* ---------------- MCP server mode (#2 #10): gitmancer tools over stdio JSON-RPC ----------------
  *
  * `gitmancer mcp` speaks the Model Context Protocol (newline-delimited JSON-RPC 2.0
@@ -2984,6 +3113,10 @@ ${bold("COMMANDS")}
                     ${dim('--out <file>   (stderr is merged into the recording)')}
   ${cyan("replay")} [<file>|--list]    replay a recorded session (or any asciinema v2 cast)
                     ${dim('--speed 2  --list')}
+  ${cyan("plan")} "<goal>"          AI drafts an ordered step-by-step plan (JSON)
+                    ${dim('--write plan.json  --json  --fast')}
+  ${cyan("execute")} [plan.json]     run a saved plan — shell steps confirmed, agent steps run the full agent
+                    ${dim('--from N  --only 1,3  --dry-run  --keep-going  --yolo  --fast  --json')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -3025,7 +3158,7 @@ ${bold("PLUGINS")} ${dim("(" + PLUGIN_COMMANDS.size + " command" + (PLUGIN_COMMA
   }
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud", "skip-gh", "dry-run", "list"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud", "skip-gh", "dry-run", "list", "keep-going"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -3104,6 +3237,8 @@ async function main() {
     case "completion": return cmdCompletions(pos, flags);
     case "record": return cmdRecord(pos, flags);
     case "replay": return cmdReplay(pos, flags);
+    case "plan": return cmdPlan(pos, flags);
+    case "execute": return cmdExecute(pos, flags);
     default:
       // plugin-defined commands (#1 #11) win before the ask-fallback
       if (PLUGIN_COMMANDS.has(cmd)) {
