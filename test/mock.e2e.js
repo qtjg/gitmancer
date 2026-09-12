@@ -156,6 +156,9 @@ const server = http.createServer((req, res) => {
           batchCalls % 2 === 1
             ? { role: "assistant", content: null, tool_calls: [{ id: `batch_${batchCalls}`, type: "function", function: { name: "batch_edit", arguments: JSON.stringify({ path: "app.js", edits: [{ find: "var a = 1", replace: "var b = 1" }, { find: "var sum = a + 2", replace: "var sum = b + 2" }] }) } }] }
             : { role: "assistant", content: "batch done." };
+      } else if (/hello2/.test(String(lastUser))) {
+        // budget flow: always demand a write so the budget check trips on the next step
+        message = { role: "assistant", content: null, tool_calls: [{ id: "bud1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "hello2.txt", content: "budget" }) } }] };
       } else if (aiCalls % 2 === 1) {
         // odd call → request a file write (so both yolo and deny scenarios work)
         message = {
@@ -264,6 +267,7 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   }
   check("two AI calls made (tool_call → final)", aiCalls >= 2);
   check("streamed answer reaches stdout", /Done — handled hello\.txt\./.test(r.stdout || ""));
+  check("usage line printed", /usage: \d+ AI calls? · ~\d+ tokens/.test(r.stdout || ""));
 
   console.log("→ fix command (agent auto-repairs a failing command)");
   const fixDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-fix-"));
@@ -374,6 +378,22 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("watch auto-fix exits 0", r.status === 0);
   check("watch fixed then green", /GREEN after \d+ fix rounds?/.test(r.stdout || ""));
   check("watch created the missing file", fs.existsSync(path.join(watchDir, "hello.txt")));
+
+  console.log("→ prbot --once: reviews an open PR, remembers, skips on re-run");
+  const botHome = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-bot-"));
+  const botEnv = { ...env, HOME: botHome };
+  r = await runCli(["prbot", "--repo", "acme/widget", "--once", "--yolo"], tmp, botEnv);
+  check("prbot exits 0", r.status === 0);
+  check("prbot reviewed PR #7", /reviewing #7/.test(r.stdout || ""));
+  check("prbot posted the review", /review posted on #7/.test(r.stdout || ""));
+  r = await runCli(["prbot", "--repo", "acme/widget", "--once", "--yolo"], tmp, botEnv);
+  check("prbot second pass exits 0", r.status === 0);
+  check("prbot skips already-reviewed PR", !/reviewing #7/.test(r.stdout || "") && /no new pull requests/.test(r.stdout || ""));
+
+  console.log("→ budget: agent loop stops when the token cap is hit");
+  r = await runCli(["ask", "please create hello2.txt", "--yolo", "--budget", "50"], tmp, env);
+  check("budget run exits 0", r.status === 0);
+  check("budget stop reported", /--budget reached/.test((r.stdout || "") + (r.stderr || "")));
 
   console.log("→ status --json");
   r = await runCli(["status", "--repo", "acme/widget", "--json"], tmp, env);
