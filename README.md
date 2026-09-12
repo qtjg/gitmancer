@@ -21,6 +21,14 @@ commit: feat(auth): validate signup inputs + rate-limit guard
 ✔ pushed main → origin
 ```
 
+## 📺 See it run — a real recording
+
+Every frame below is **real CLI output**, captured with `gitmancer record` — version banner, the plugin system scaffolding and running a plugin command, `secscan` catching (and redacting) a planted GitHub token, and the full help menu. No mocked screens.
+
+![gitmancer demo — version · plugin system · secscan · help](docs/demo.gif)
+
+<sub>Terminal-native playback: <code>gitmancer replay docs/demo.cast</code> · regenerate both artifacts with <code>node scripts/gen-demo-cast.js && python3 scripts/cast-to-gif.py</code>.</sub>
+
 ## What's new in v0.5.0 — release autopilot · security · fleet · triage
 
 - **`changelog` / `release`** — AI release notes from any commit range (Keep-a-Changelog style); `release patch|minor|major` bumps the version, writes the CHANGELOG section, commits, tags and (optionally) pushes + publishes the GitHub Release in one shot (`--no-push` / `--skip-gh` / `--dry-run` escapes).
