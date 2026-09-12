@@ -1947,6 +1947,53 @@ async function cmdTestgen(pos, flags) {
   }
 }
 
+/* ---------------- explain: AI explains a file, a diff/rev, or a command ---------------- */
+
+async function cmdExplain(pos, flags) {
+  const cfg = applyFast(loadConfig(), flags);
+  banner();
+  const target = pos.join(" ").trim();
+  if (!target) throw new UserErr("usage: gitmancer explain <file | git-rev | rev-range | command>");
+  const root = gitRoot(process.cwd());
+  let mode = "cmd";
+  let material = target;
+  if (fs.existsSync(path.resolve(process.cwd(), target.split("..")[0])) && fs.statSync(path.resolve(process.cwd(), target.split("..")[0])).isFile()) {
+    mode = "file";
+    material = `File ${target}:\n${capOut(fs.readFileSync(path.resolve(process.cwd(), target), "utf8"), 12000)}`;
+  } else if (root) {
+    let isRev = false;
+    try {
+      const probe = target.includes("..") ? target.split(/\.{2,3}/)[0] : target + "^{commit}";
+      gitOut(["rev-parse", "--verify", "--quiet", probe], root);
+      isRev = true;
+    } catch {
+      isRev = false;
+    }
+    if (isRev) {
+      mode = "diff";
+      try {
+        material = target.includes("..")
+          ? `git diff ${target}:\n${capOut(gitOut(["diff", target], root), 12000)}`
+          : `git show ${target}:\n${capOut(gitOut(["show", "--stat", "--patch", target], root), 12000)}`;
+      } catch (e) {
+        throw new UserErr(`cannot read ${target}: ${String(e.message).split("\n")[0]}`);
+      }
+    }
+  }
+  const prompts = {
+    file: "You explain source code. Explain what this file does, its exports/surface, key logic, and anything risky. Be concrete, max ~200 words. [explain:file]",
+    diff: "You explain git changes. Explain what this diff changes, why it likely exists, and flag any risk. Max ~200 words. [explain:diff]",
+    cmd: "You explain developer commands. Explain what this command does, when to use it, and any gotchas. Max ~120 words. [explain:cmd]",
+  };
+  const { message } = await aiChat(cfg, [
+    { role: "system", content: prompts[mode] },
+    { role: "user", content: capOut(material, 14000) },
+  ]);
+  const text = String((message && message.content) || "").trim();
+  if (!text) throw new UserErr("AI returned an empty explanation");
+  console.log(text);
+}
+
 /* ---------------- review: AI code review of a pull request ---------------- */
 
 async function cmdReview(pos, flags) {
@@ -2181,6 +2228,8 @@ ${bold("COMMANDS")}
                     ${dim('--staged  --path <p>  --json')}
   ${cyan("testgen")} <file>        AI-generates unit tests for a source file (dry preview; --write to save)
                     ${dim('--write  --yolo  --fast')}
+  ${cyan("explain")} <target>      AI explains a file, a git rev/range, or a shell command
+                    ${dim('explain app.js · explain HEAD~1..HEAD · explain "git rebase --onto"')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2277,6 +2326,7 @@ async function main() {
     case "release": return cmdRelease(pos, flags);
     case "secscan": return cmdSecscan(pos, flags);
     case "testgen": return cmdTestgen(pos, flags);
+    case "explain": return cmdExplain(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);

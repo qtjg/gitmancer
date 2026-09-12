@@ -162,6 +162,11 @@ const server = http.createServer((req, res) => {
       } else if (/\[gitmancer testgen\]/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
         // testgen flow: deterministic test-file content (wrapped in fences to exercise stripping)
         message = { role: "assistant", content: "```js\n// MOCK-TEST generated\nconst test = require('node:test');\n```" };
+      } else if (/\[explain:/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
+        // explain flow: echo the resolved mode back
+        const sys0 = String((((reqBody.messages || [])[0]) || {}).content || "");
+        const em = (/\[explain:(\w+)\]/.exec(sys0) || [])[1] || "?";
+        message = { role: "assistant", content: `EXPLAIN-OK (${em}) — mock explanation.` };
       } else if (/receipts verify test/.test(String(lastUser))) {
         // ask --verify flow: cite one real file:line and one broken reference
         message = { role: "assistant", content: "The adder lives in `calc.js:1`; the old helper was `missing.js:9`." };
@@ -566,6 +571,27 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   const tgFile = path.join(tgDir, "calc.test.js");
   check("testgen --yolo writes test file", fs.existsSync(tgFile) && /MOCK-TEST generated/.test(fs.readFileSync(tgFile, "utf8")));
   check("testgen strips markdown fences", !fs.readFileSync(tgFile, "utf8").includes("```"));
+
+  console.log("→ explain: file / diff / command modes");
+  const exDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-ex-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: exDir });
+  spawnSync("git", ["config", "user.email", "t@t.local"], { cwd: exDir });
+  spawnSync("git", ["config", "user.name", "t"], { cwd: exDir });
+  fs.writeFileSync(path.join(exDir, "app.js"), "console.log('v1');\n");
+  spawnSync("git", ["add", "."], { cwd: exDir });
+  spawnSync("git", ["commit", "-m", "feat: v1"], { cwd: exDir });
+  fs.writeFileSync(path.join(exDir, "app.js"), "console.log('v2');\n");
+  spawnSync("git", ["add", "."], { cwd: exDir });
+  spawnSync("git", ["commit", "-m", "feat: v2"], { cwd: exDir });
+  r = await runCli(["explain", "HEAD~1..HEAD"], exDir, env);
+  check("explain diff exits 0", r.status === 0);
+  check("explain diff answers", /EXPLAIN-OK \(diff\)/.test(r.stdout || ""));
+  r = await runCli(["explain", "app.js"], exDir, env);
+  check("explain file exits 0", r.status === 0);
+  check("explain file answers", /EXPLAIN-OK \(file\)/.test(r.stdout || ""));
+  r = await runCli(["explain", "git rebase --onto"], exDir, env);
+  check("explain command exits 0", r.status === 0);
+  check("explain command answers", /EXPLAIN-OK \(cmd\)/.test(r.stdout || ""));
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
