@@ -528,6 +528,30 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   r = await runCli(["release", "banana"], relDir, env);
   check("release rejects invalid bump", r.status !== 0);
 
+  console.log("→ secscan: finds planted secrets, redacts, exits 1");
+  const secDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-sec-"));
+  spawnSync("git", ["init", "-b", "main"], { cwd: secDir });
+  spawnSync("git", ["config", "user.email", "t@t.local"], { cwd: secDir });
+  spawnSync("git", ["config", "user.name", "t"], { cwd: secDir });
+  const FAKE_GH = "ghp_" + "A".repeat(32) + "1111";
+  const FAKE_AWS = "AKIA" + "B7C8D9E0" + "F1A2B3C4";
+  fs.writeFileSync(path.join(secDir, "config.js"), `const token = "${FAKE_GH}";\nconst fine = "clean";\n`);
+  fs.writeFileSync(path.join(secDir, "creds.txt"), `aws = ${FAKE_AWS}\n`);
+  spawnSync("git", ["add", "."], { cwd: secDir });
+  spawnSync("git", ["commit", "-m", "fix: add config"], { cwd: secDir });
+  r = await runCli(["secscan"], secDir, env);
+  check("secscan detects planted secrets (exit 1)", r.status === 1);
+  check("secscan names rules + files", /github-token/.test(r.stdout || "") && /aws-key/.test(r.stdout || ""));
+  check("secscan redacts the secret value", !((r.stdout || "") + (r.stderr || "")).includes(FAKE_GH));
+  r = await runCli(["secscan", "--json"], secDir, env);
+  j = null;
+  try { j = JSON.parse(r.stdout); } catch {}
+  check("secscan --json parses with findings", !!(j && j.count === 2 && Array.isArray(j.findings)));
+  fs.writeFileSync(path.join(secDir, "clean.txt"), "nothing here\n");
+  spawnSync("git", ["add", "clean.txt"], { cwd: secDir });
+  r = await runCli(["secscan", "--staged"], secDir, env);
+  check("secscan --staged clean exits 0", r.status === 0 && /clean — no secrets/.test(r.stdout || ""));
+
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
   if (failed.length) {

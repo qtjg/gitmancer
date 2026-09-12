@@ -1780,6 +1780,126 @@ async function cmdRelease(pos, flags) {
   }
 }
 
+/* ---------------- secscan: gitleaks-style secret scanning ---------------- */
+
+const SECRET_RULES = [
+  { id: "aws-key", label: "AWS access key", re: /\bAKIA[0-9A-Z]{16}\b/ },
+  { id: "github-token", label: "GitHub token", re: /\b(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{20,})\b/ },
+  { id: "openai-key", label: "OpenAI-style key", re: /\bsk-[A-Za-z0-9_-]{20,}\b/ },
+  { id: "slack-token", label: "Slack token", re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/ },
+  { id: "google-key", label: "Google API key", re: /\bAIza[0-9A-Za-z_-]{35}\b/ },
+  { id: "private-key", label: "private key block", re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+  { id: "generic-secret", label: "hard-coded secret", re: /(?:api[_-]?key|apikey|secret|passwd|password|token|auth)\s*[:=]\s*["'][^"']{8,}["']/i },
+];
+
+const SECRET_PLACEHOLDER =
+  /(?:xxxx|example|changeme|change-me|placeholder|your[-_]|<[^>]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|\bnull\b|test[-_]?key\b|dummy|sample|redacted|sk-xxx)/i;
+
+function scanTextForSecrets(text) {
+  const findings = [];
+  const lines = String(text || "").split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    for (const rule of SECRET_RULES) {
+      rule.re.lastIndex = 0;
+      const m = rule.re.exec(lines[i]);
+      if (!m) continue;
+      const snippet = m[0].trim();
+      if (SECRET_PLACEHOLDER.test(snippet)) continue;
+      const preview = snippet.length > 10 ? snippet.slice(0, 6) + "…" + "****" + ` (${snippet.length} chars)` : snippet;
+      findings.push({ rule: rule.id, label: rule.label, line: i + 1, preview });
+      break; // one finding per line — first rule wins
+    }
+  }
+  return findings;
+}
+
+function isBinaryBuf(buf) {
+  const n = Math.min(buf.length, 8000);
+  for (let i = 0; i < n; i++) if (buf[i] === 0) return true;
+  return false;
+}
+
+function scanRepoForSecrets(root, opts = {}) {
+  const res = { findings: [], scanned: 0, skipped: 0, truncated: false };
+  if (opts.staged) {
+    let diff = "";
+    try {
+      diff = gitOut(["diff", "--cached", "--unified=0", "--no-color"], root);
+    } catch (e) {
+      throw new UserErr(e.message);
+    }
+    let curFile = "(unknown)";
+    for (const line of diff.split("\n")) {
+      if (line.startsWith("+++ b/")) curFile = line.slice(6);
+      else if (line.startsWith("+") && !line.startsWith("+++")) {
+        for (const f of scanTextForSecrets(line.slice(1))) res.findings.push({ file: curFile, ...f });
+      }
+    }
+    return res;
+  }
+  let files = [];
+  try {
+    files = (typeof opts.path === "string" && opts.path) ? [opts.path] : gitOut(["ls-files"], root).split("\n").filter(Boolean);
+  } catch (e) {
+    throw new UserErr(`not a git repository? (${String(e.message).split("\n")[0]})`);
+  }
+  const MAX_FILES = 2000;
+  const MAX_BYTES = 1024 * 1024;
+  if (files.length > MAX_FILES) {
+    res.truncated = true;
+    files = files.slice(0, MAX_FILES);
+  }
+  for (const f of files) {
+    const abs = path.resolve(root, f);
+    let st;
+    try {
+      st = fs.statSync(abs);
+    } catch {
+      continue;
+    }
+    if (!st.isFile() || st.size > MAX_BYTES) {
+      res.skipped++;
+      continue;
+    }
+    let buf;
+    try {
+      buf = fs.readFileSync(abs);
+    } catch {
+      res.skipped++;
+      continue;
+    }
+    if (isBinaryBuf(buf)) {
+      res.skipped++;
+      continue;
+    }
+    for (const fnd of scanTextForSecrets(buf.toString("utf8"))) res.findings.push({ file: f, ...fnd });
+    res.scanned++;
+  }
+  return res;
+}
+
+async function cmdSecscan(pos, flags) {
+  const root = gitRoot(process.cwd());
+  if (!root) throw new UserErr("secscan must run inside a git repository");
+  const opts = { staged: !!flags.staged, path: typeof flags.path === "string" ? flags.path : null };
+  const res = scanRepoForSecrets(root, opts);
+  if (flags.json) return console.log(JSON.stringify({ scanned: res.scanned, skipped: res.skipped, truncated: res.truncated, count: res.findings.length, findings: res.findings }, null, 2));
+  banner();
+  const scope = opts.staged ? "staged changes" : opts.path ? `path ${opts.path}` : "tracked files";
+  console.log(dim(`scanning ${scope}…\n`));
+  for (const f of res.findings) {
+    console.log(`  ${red("✖")} ${bold(f.file)}:${f.line}  ${yellow(f.rule)}  ${dim(f.label)}  ${f.preview}`);
+  }
+  if (!res.findings.length) {
+    ok(`clean — no secrets in ${res.scanned} file(s)${res.skipped ? ` (skipped ${res.skipped} binary/large)` : ""}`);
+  } else {
+    fail(`${res.findings.length} potential secret(s) found — revoke & rotate, never commit them`);
+    console.log(dim(`\ntip: gitmancer hook install pre-commit  → blocks commits containing secrets`));
+  }
+  if (res.truncated) warn(`file list truncated at 2000 files`);
+  process.exitCode = res.findings.length ? 1 : 0;
+}
+
 /* ---------------- review: AI code review of a pull request ---------------- */
 
 async function cmdReview(pos, flags) {
@@ -2010,6 +2130,8 @@ ${bold("COMMANDS")}
                     ${dim('--to HEAD  --write (CHANGELOG.md)  --json')}
   ${cyan("release")} patch|minor|major
                     ${dim('bump version + CHANGELOG + tag + push + GitHub release  --no-push  --skip-gh  --dry-run')}
+  ${cyan("secscan")}               scan tracked files (or --staged) for API keys & secrets — exit 1 if found
+                    ${dim('--staged  --path <p>  --json')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2034,6 +2156,8 @@ ${bold("EXAMPLES")}
   gitmancer ship --no-push                ${dim("# AI commit message, stay local")}
   gitmancer newrepo my-lib --template node-lib --source ./my-lib
   gitmancer issue me/myrepo create "Bug: login fails on Safari"
+  gitmancer secscan --staged             ${dim("# block secrets before they're committed")}
+  gitmancer hook install pre-commit      ${dim("# enforce secscan on every commit")}
 `);
 }
 
@@ -2102,6 +2226,7 @@ async function main() {
     case "prbot": return cmdPrbot(pos, flags);
     case "changelog": return cmdChangelog(pos, flags);
     case "release": return cmdRelease(pos, flags);
+    case "secscan": return cmdSecscan(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
