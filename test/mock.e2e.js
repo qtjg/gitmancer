@@ -25,6 +25,8 @@ let cacheAsks = 0;
 let labelPosts = 0;
 let plugCalls = 0;
 let diceInTools = false;
+let lastModel = "";
+let exclSeen = false;
 const failed = [];
 
 function check(name, cond) {
@@ -68,6 +70,8 @@ const server = http.createServer((req, res) => {
       try {
         reqBody = JSON.parse(body || "{}");
       } catch {}
+      lastModel = reqBody.model || lastModel;
+      exclSeen = exclSeen || String((((reqBody.messages || [])[0]) || {}).content || "").includes("EXCLUDED PATHS");
       const lastUser = ((reqBody.messages || []).filter((m) => m.role === "user").pop() || {}).content || "";
       let message;
       if (/retry test/.test(String(lastUser))) {
@@ -867,6 +871,30 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
     fs.writeFileSync(path.join(planDir, "bad.json"), "{not json");
     r = await runCli(["execute", "bad.json"], planDir, env);
     check("execute of invalid JSON fails cleanly", r.status !== 0 && /bad plan JSON/.test((r.stderr || "") + (r.stdout || "")));
+  }
+
+  console.log("→ workspace profiles (#7): per-project .gitmancer.json overrides");
+  {
+    const profDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-prof-"));
+    // profile model must be able to win → strip the env model for this scenario (env always beats profiles by design)
+    const profEnv = { ...env, GITMANCER_AI_MODEL: "" };
+    fs.writeFileSync(path.join(profDir, ".gitmancer.json"), JSON.stringify({ model: "profile-model-x", steps: 7, flags: ["verify"], exclude: ["vault/"] }));
+    r = await runCli(["profile"], profDir, profEnv);
+    check("profile shows merged model", r.status === 0 && /profile-model-x/.test(r.stdout || ""));
+    check("profile lists exclude paths", /vault\//.test(r.stdout || ""));
+    r = await runCli(["ask", "profile test", "--yolo"], profDir, profEnv);
+    check("profile ask exits 0", r.status === 0);
+    check("profile model reached the AI provider", lastModel === "profile-model-x");
+    check("exclude policy reached the system prompt", exclSeen === true);
+    r = await runCli(["profile", "init"], profDir, profEnv);
+    check("profile init refuses overwrite without --force", r.status !== 0);
+    fs.writeFileSync(path.join(profDir, ".gitmancer.json"), JSON.stringify({ aiKey: "sk-secret-in-profile" }));
+    r = await runCli(["profile"], profDir, profEnv);
+    const po = (r.stdout || "") + (r.stderr || "");
+    check("secret-shaped key in profile is flagged", /IGNORED/.test(po));
+    check("secret value never echoed back", !po.includes("sk-secret-in-profile"));
+    r = await runCli(["profile", "init", "--force"], profDir, profEnv);
+    check("profile init --force scaffolds template", r.status === 0 && /_comment/.test(fs.readFileSync(path.join(profDir, ".gitmancer.json"), "utf8")));
   }
 
   server.close();

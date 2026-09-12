@@ -830,6 +830,13 @@ function systemPrompt(ctx) {
       mem
     );
   }
+  if (ctx.cfg && Array.isArray(ctx.cfg.__exclude) && ctx.cfg.__exclude.length) {
+    lines.push(
+      "",
+      "EXCLUDED PATHS (workspace profile policy — never read, modify, or list contents of these):",
+      ctx.cfg.__exclude.map((x) => "- " + x).join("\n")
+    );
+  }
   return lines.join("\n");
 }
 
@@ -877,6 +884,65 @@ function applyFast(cfg, flags) {
   if (p && p.fast && cfg.aiModel === p.model) return { ...cfg, aiModel: p.fast, __fast: true };
   return cfg;
 }
+
+/* ---------------- workspace profiles (#7): per-project .gitmancer.json ---------------- */
+
+const PROFILE_FILE = ".gitmancer.json";
+const PROFILE_FLAG_WHITELIST = ["fast", "verify", "chat"]; // yolo is deliberately NOT grantable from a file
+
+function loadProfile(cwd) {
+  const file = path.join(cwd, PROFILE_FILE);
+  if (!fs.existsSync(file)) return null;
+  try {
+    const p = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!p || typeof p !== "object" || Array.isArray(p)) {
+      warn(`${PROFILE_FILE} is not a JSON object — ignoring profile`);
+      return null;
+    }
+    return p;
+  } catch (e) {
+    warn(`${PROFILE_FILE} unreadable (${String(e.message).split("\n")[0]}) — ignoring profile`);
+    return null;
+  }
+}
+
+function applyProfile(cfg, flags, cwd) {
+  const p = loadProfile(cwd);
+  if (!p) return cfg;
+  if (p.aiKey || p.githubToken || p.key || p.token) {
+    warn(`${PROFILE_FILE} contains key/token fields — IGNORED. Secrets belong in ~/.gitmancer/config.json (chmod 600), never in a repo file.`);
+  }
+  const out = { ...cfg };
+  if (p.model && !process.env.GITMANCER_AI_MODEL) out.aiModel = String(p.model);
+  if (p.base) out.aiBase = String(p.base);
+  if (p.preset && PRESETS[String(p.preset)]) out.preset = String(p.preset);
+  if (Number.isFinite(p.steps) && flags && flags.steps === undefined) flags.steps = p.steps;
+  if (Number.isFinite(p.budget) && flags && flags.budget === undefined) flags.budget = p.budget;
+  if (Array.isArray(p.flags)) {
+    for (const f of p.flags) {
+      if (PROFILE_FLAG_WHITELIST.includes(f) && flags && flags[f] === undefined) flags[f] = true;
+      else if (!PROFILE_FLAG_WHITELIST.includes(f)) warn(`${PROFILE_FILE}: flag "${f}" is not in the whitelist (${PROFILE_FLAG_WHITELIST.join(", ")}) — skipped`);
+    }
+  }
+  if (Array.isArray(p.exclude) && p.exclude.length) out.__exclude = p.exclude.map(String);
+  out.__profile = true;
+  return out;
+}
+
+function loadTuned(flags) {
+  const cfg = applyFast(loadConfig(), flags);
+  const cwd = path.resolve((flags && flags.cwd) || process.cwd());
+  return applyProfile(cfg, flags, cwd);
+}
+
+const PROFILE_TEMPLATE = {
+  _comment: "gitmancer workspace profile — safe per-project overrides. Secrets belong in ~/.gitmancer/config.json, never here.",
+  model: "llama-3.3-70b-versatile",
+  steps: 30,
+  budget: 150000,
+  flags: ["verify"],
+  exclude: ["secrets/", "infra/*.env"],
+};
 
 function mkCtx(flags, cfg) {
   const ctx = {
@@ -1083,7 +1149,7 @@ async function cmdRepos(flags) {
 }
 
 async function cmdAsk(pos, flags) {
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   if (cfg.__fast) console.log(dim(`fast mode → ${cfg.aiModel}`));
   const ctx = mkCtx(flags, cfg);
   const sys = systemPrompt(ctx);
@@ -1389,7 +1455,7 @@ async function cmdIssue(pos, flags) {
 async function cmdFix(pos, flags) {
   const command = pos.join(" ").trim();
   if (!command) throw new UserErr('usage: gitmancer fix "<command>"  — e.g. gitmancer fix "npm test"');
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   if (cfg.__fast) console.log(dim(`fast mode → ${cfg.aiModel}`));
   const ctx = mkCtx(flags, cfg);
   banner();
@@ -1420,7 +1486,7 @@ async function cmdWatch(pos, flags) {
   const command = pos.join(" ").trim();
   if (!command) throw new UserErr('usage: gitmancer watch "<command>"  — e.g. gitmancer watch "npm test"');
   const maxTries = Math.min(Math.max(parseInt(flags.max, 10) || 3, 1), 10);
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   const ctx = mkCtx(flags, cfg);
   banner();
   console.log(dim(`watching: $ ${command}  (up to ${maxTries} attempt${maxTries === 1 ? "" : "s"}, auto-fix between runs)\n`));
@@ -1538,7 +1604,7 @@ function cmdUndo(pos, flags) {
 /* ---------------- prbot: auto-review incoming pull requests ---------------- */
 
 async function cmdPrbot(pos, flags) {
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   const root = gitRoot(process.cwd());
   const repo = (typeof flags.repo === "string" && flags.repo) || (root ? parseOriginRepo(root) : null);
   if (!repo || !repo.includes("/")) throw new UserErr("usage: gitmancer prbot [--repo owner/name] [--interval 300] [--once] [--yolo]");
@@ -1654,7 +1720,7 @@ async function aiPrDraft(cfg, root, base) {
 }
 
 async function cmdPr(pos, flags) {
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   const root = gitRoot(process.cwd());
   const repoArg = pos[0];
   const action = repoArg === "list" || repoArg === "close" || repoArg === "merge" ? repoArg : null;
@@ -2016,7 +2082,7 @@ async function cmdSecscan(pos, flags) {
 /* ---------------- testgen: AI unit-test generation for a source file ---------------- */
 
 async function cmdTestgen(pos, flags) {
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   banner();
   const target = pos[0];
   if (!target) throw new UserErr("usage: gitmancer testgen <file> [--write]  — AI-generates unit tests for a source file");
@@ -2063,7 +2129,7 @@ async function cmdTestgen(pos, flags) {
 /* ---------------- explain: AI explains a file, a diff/rev, or a command ---------------- */
 
 async function cmdExplain(pos, flags) {
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   banner();
   const target = pos.join(" ").trim();
   if (!target) throw new UserErr("usage: gitmancer explain <file | git-rev | rev-range | command>");
@@ -2217,7 +2283,7 @@ async function aiTriageIssue(cfg, issue) {
 }
 
 async function cmdTriage(pos, flags) {
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   if (!flags.json) banner();
   const slug = ((typeof flags.repo === "string" && flags.repo) || pos[0] || "").replace(/^https?:\/\/github\.com\//, "");
   if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) throw new UserErr("usage: gitmancer triage <owner/repo> [--apply] [--limit 20] [--json]");
@@ -2336,7 +2402,7 @@ async function cmdHook(pos, flags) {
 /* ---------------- review: AI code review of a pull request ---------------- */
 
 async function cmdReview(pos, flags) {
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   const root = gitRoot(process.cwd());
   const repo = (typeof flags.repo === "string" && flags.repo) || (root ? parseOriginRepo(root) : null);
   const num = parseInt(pos[0], 10);
@@ -2789,7 +2855,7 @@ function extractJson(text) {
 async function cmdPlan(pos, flags) {
   const task = pos.join(" ").trim();
   if (!task) throw new UserErr(`usage: ${NAME} plan "<goal>" --write plan.json — AI drafts a step-by-step plan you can execute`);
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   const ctx = mkCtx(flags, cfg);
   const sys = [
     "You are gitmancer's planning module. Break the user's goal into concrete, ordered steps.",
@@ -2846,7 +2912,7 @@ async function cmdExecute(pos, flags) {
   const only = flags.only ? String(flags.only).split(",").map((n) => parseInt(n, 10)).filter(Boolean) : null;
   banner();
   console.log(`\n${bold("EXECUTE: " + (plan.title || file))}${flags["dry-run"] ? yellow("  (dry run — nothing will run)") : ""}\n`);
-  const cfg = applyFast(loadConfig(), flags);
+  const cfg = loadTuned(flags);
   const results = [];
   let failed = 0;
   for (const raw of plan.steps) {
@@ -3047,6 +3113,39 @@ async function cmdMcp() {
   await new Promise((resolve) => wire.on("close", resolve));
 }
 
+/* ---------------- workspace profile command (#7) ---------------- */
+
+function cmdProfile(pos, flags) {
+  const cwd = process.cwd();
+  const file = path.join(cwd, PROFILE_FILE);
+  banner();
+  if ((pos[0] || "").toLowerCase() === "init") {
+    if (fs.existsSync(file) && !flags.force) throw new UserErr(`${file} already exists — use --force to overwrite`);
+    fs.writeFileSync(file, JSON.stringify(PROFILE_TEMPLATE, null, 2) + "\n");
+    ok(`wrote ${file} — edit it, then check with ${cyan(`${NAME} profile`)}`);
+    return;
+  }
+  const p = loadProfile(cwd);
+  if (!p) {
+    console.log(`no ${bold(PROFILE_FILE)} in ${dim(cwd)}\n\nthis workspace runs on your global config as-is\nscaffold one:  ${cyan(`${NAME} profile init`)}
+`);
+    return;
+  }
+  const flagsCfg = {};
+  const merged = applyProfile(loadConfig(), flagsCfg, cwd);
+  console.log(`\n${bold("workspace profile")} ${dim(file)}\n`);
+  console.log(`  model     ${bold(merged.aiModel)}${p.model ? "" : dim(" (global — not overridden)")}`);
+  console.log(`  base      ${dim(merged.aiBase)}`);
+  if (Number.isFinite(p.steps)) console.log(`  steps     ${bold(p.steps)}`);
+  if (Number.isFinite(p.budget)) console.log(`  budget    ${bold(p.budget + " tokens")}`);
+  if (Array.isArray(p.flags)) console.log(`  flags     ${cyan(p.flags.join(", "))}  ${dim("whitelist: " + PROFILE_FLAG_WHITELIST.join("/ "))}`);
+  if (merged.__exclude) console.log(`  exclude   ${yellow(merged.__exclude.join("  "))}  ${dim("(agent is told to never touch these)")}`);
+  const unknown = Object.keys(p).filter((k) => !k.startsWith("_") && !["model", "base", "preset", "steps", "budget", "flags", "exclude", "aiKey", "githubToken", "key", "token"].includes(k));
+  if (unknown.length) warn(`unknown key(s) ignored: ${unknown.join(", ")}`);
+  if (p.aiKey || p.githubToken || p.key || p.token) fail("secret-shaped keys detected in the profile — they are IGNORED by design; move them to ~/.gitmancer/config.json");
+  console.log("");
+}
+
 /* ---------------- help / arg parsing / main ---------------- */
 
 function help() {
@@ -3117,6 +3216,8 @@ ${bold("COMMANDS")}
                     ${dim('--write plan.json  --json  --fast')}
   ${cyan("execute")} [plan.json]     run a saved plan — shell steps confirmed, agent steps run the full agent
                     ${dim('--from N  --only 1,3  --dry-run  --keep-going  --yolo  --fast  --json')}
+  ${cyan("profile")} [init]           show this workspace's .gitmancer.json profile + merged effective config
+                    ${dim('init [--force] scaffolds one — safe keys only, secrets stay in the global config')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -3239,6 +3340,7 @@ async function main() {
     case "replay": return cmdReplay(pos, flags);
     case "plan": return cmdPlan(pos, flags);
     case "execute": return cmdExecute(pos, flags);
+    case "profile": return cmdProfile(pos, flags);
     default:
       // plugin-defined commands (#1 #11) win before the ask-fallback
       if (PLUGIN_COMMANDS.has(cmd)) {
