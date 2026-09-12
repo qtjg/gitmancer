@@ -15,6 +15,8 @@ const CLI = path.join(ROOT, "gitmancer.js");
 
 let aiCalls = 0;
 let fixCalls = 0;
+let paraCalls = 0;
+let mixCalls = 0;
 let userHits = 0;
 let retryTrips = 0;
 let cacheAsks = 0;
@@ -105,6 +107,35 @@ const server = http.createServer((req, res) => {
                 ],
               }
             : { role: "assistant", content: "Wrote the missing app.js — syntax is valid now." };
+      } else if (/^parallel test$/.test(String(lastUser))) {
+        // parallel dispatch: one turn → 3 read-only tool calls, follow-up → final text
+        paraCalls++;
+        message =
+          paraCalls % 2 === 1
+            ? {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  { id: "pa1", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "a.txt" }) } },
+                  { id: "pa2", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "b.txt" }) } },
+                  { id: "pa3", type: "function", function: { name: "list_files", arguments: JSON.stringify({ path: "." }) } },
+                ],
+              }
+            : { role: "assistant", content: "Done — parallel reads complete." };
+      } else if (/^mixed test$/.test(String(lastUser))) {
+        // mixed batch: read-only + mutating in one turn — mutating must stay gated
+        mixCalls++;
+        message =
+          mixCalls % 2 === 1
+            ? {
+                role: "assistant",
+                content: null,
+                tool_calls: [
+                  { id: "mx1", type: "function", function: { name: "read_file", arguments: JSON.stringify({ path: "ok.txt" }) } },
+                  { id: "mx2", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "bad.txt", content: "evil" }) } },
+                ],
+              }
+            : { role: "assistant", content: "Done — mixed handled." };
       } else if (aiCalls % 2 === 1) {
         // odd call → request a file write (so both yolo and deny scenarios work)
         message = {
@@ -258,6 +289,27 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("retry ask exits 0", r.status === 0);
   check("recovered after 500 — final answer shown", /retry ok/.test(r.stdout || ""));
   check("server saw the retried request", retryTrips >= 1);
+
+  console.log("→ parallel tool dispatch (read-only batch runs concurrently)");
+  const paraDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-para-"));
+  fs.writeFileSync(path.join(paraDir, "a.txt"), "AAA content");
+  fs.writeFileSync(path.join(paraDir, "b.txt"), "BBB content");
+  r = await runCli(["ask", "parallel test", "--yolo"], paraDir, env);
+  check("parallel ask exits 0", r.status === 0);
+  check("parallel tag shown", /\(parallel\)/.test(r.stdout || ""));
+  check("all three reads executed", /AAA content/.test(r.stdout || "") && /BBB content/.test(r.stdout || ""));
+  check("result order preserved (AAA before BBB)", (r.stdout || "").indexOf("AAA content") < (r.stdout || "").indexOf("BBB content"));
+  check("final answer after parallel batch", /Done — parallel reads complete\./.test(r.stdout || ""));
+
+  console.log("→ mixed batch: mutating tool stays gated next to read-only ones");
+  const mixDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-mix-"));
+  fs.writeFileSync(path.join(mixDir, "ok.txt"), "fine content");
+  r = await runCli(["ask", "mixed test"], mixDir, env, 30000, "n\n");
+  check("mixed run exits 0 (deny handled)", r.status === 0);
+  check("read-only call still executed", /fine content/.test(r.stdout || ""));
+  check("mutating call was gated", /DENIED/.test(r.stdout || ""));
+  check("write denied — no file created", !fs.existsSync(path.join(mixDir, "bad.txt")));
+  check("final answer after mixed batch", /Done — mixed handled\./.test(r.stdout || ""));
 
   console.log("→ status --json");
   r = await runCli(["status", "--repo", "acme/widget", "--json"], tmp, env);
