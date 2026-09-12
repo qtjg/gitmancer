@@ -13,7 +13,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const readline = require("readline");
-const { spawnSync } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
 
 const VERSION = "0.5.0";
 const NAME = "gitmancer";
@@ -2682,6 +2682,96 @@ function cmdCompletions(pos) {
   process.stdout.write(completionsScript(shell));
 }
 
+/* ---------------- session record & replay (#4) — asciinema v2 .cast ---------------- */
+
+function sessionsDir() {
+  return path.join(CONFIG_DIR, "sessions");
+}
+
+async function cmdRecord(pos, flags) {
+  const command = pos.join(" ").trim();
+  if (!command) throw new UserErr(`usage: ${NAME} record "<command>" — run it and tee the output into an asciinema v2 .cast session`);
+  fs.mkdirSync(sessionsDir(), { recursive: true, mode: 0o700 });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const file = flags.out ? path.resolve(String(flags.out)) : path.join(sessionsDir(), `${stamp}.cast`);
+  const child = spawn(command, { shell: true, cwd: process.cwd(), env: process.env, stdio: ["inherit", "pipe", "pipe"] });
+  const t0 = Date.now();
+  const header = {
+    version: 2,
+    width: parseInt(process.env.COLUMNS, 10) || 100,
+    height: parseInt(process.env.LINES, 10) || 30,
+    timestamp: Math.floor(t0 / 1000),
+    env: { SHELL: process.env.SHELL || "/bin/sh", TERM: process.env.TERM || "xterm-256color" },
+    command,
+  };
+  const out = fs.createWriteStream(file, { mode: 0o600 });
+  out.write(JSON.stringify(header) + "\n");
+  const elapsed = () => ((Date.now() - t0) / 1000).toFixed(6);
+  const capture = (chunk) => {
+    process.stdout.write(chunk); // stderr is merged into the "o" stream — noted in help
+    out.write(JSON.stringify([elapsed(), "o", chunk.toString()]) + "\n");
+  };
+  child.stdout.on("data", capture);
+  child.stderr.on("data", capture);
+  const code = await new Promise((resolve) => {
+    child.on("error", (e) => {
+      fail(e.message);
+      resolve(127);
+    });
+    child.on("exit", (c) => resolve(c == null ? 1 : c));
+  });
+  await new Promise((r) => out.end(r));
+  ok(`session saved → ${file} (${fs.statSync(file).size} bytes)`);
+  console.log(dim(`replay:  ${NAME} replay ${file}\n`));
+  process.exitCode = code;
+}
+
+async function cmdReplay(pos, flags) {
+  if (flags.list) {
+    const d = sessionsDir();
+    const files = fs.existsSync(d) ? fs.readdirSync(d).filter((f) => f.endsWith(".cast")).sort().reverse() : [];
+    if (!files.length) {
+      console.log(`no sessions in ${dim(d)} — record one: ${cyan(`${NAME} record "npm test"`)}\n`);
+      return;
+    }
+    console.log(`\n${bold(files.length + " recorded session" + (files.length === 1 ? "" : "s"))} ${dim("in " + d)}\n`);
+    for (const f of files) {
+      const st = fs.statSync(path.join(d, f));
+      console.log(`  ${bold(f)}  ${dim(new Date(st.mtime).toISOString().slice(0, 16).replace("T", " "))}  ${dim((st.size / 1024).toFixed(1) + "kb")}`);
+    }
+    console.log("");
+    return;
+  }
+  const target = String(pos[0] || "");
+  if (!target) throw new UserErr(`usage: ${NAME} replay <file.cast | session-name>  ·  --list  ·  --speed 2`);
+  const file = fs.existsSync(target)
+    ? target
+    : (() => {
+        const c = path.join(sessionsDir(), target.endsWith(".cast") ? target : target + ".cast");
+        return fs.existsSync(c) ? c : null;
+      })();
+  if (!file) throw new UserErr(`session not found: ${target} (try --list)`);
+  const speed = Math.max(parseFloat(flags.speed) || 1, 0.1);
+  const events = [];
+  for (const l of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!l.trim()) continue;
+    try {
+      const j = JSON.parse(l);
+      if (Array.isArray(j) && j.length >= 3) events.push(j);
+    } catch {}
+  }
+  if (!events.length) throw new UserErr(`${file} contains no timed events — not a valid asciinema v2 cast`);
+  console.error(dim(`▶ replaying ${path.basename(file)} — ${events.length} events @ ${speed}x (output-only; idle gaps capped at 3s)`));
+  let prev = 0;
+  for (const ev of events) {
+    const t = Number(ev[0]) || 0;
+    const wait = Math.max(t - prev, 0) / speed;
+    prev = t;
+    if (wait > 0) await sleep(Math.min(wait, 3000));
+    if (ev[1] === "o") process.stdout.write(String(ev[2]));
+  }
+}
+
 /* ---------------- MCP server mode (#2 #10): gitmancer tools over stdio JSON-RPC ----------------
  *
  * `gitmancer mcp` speaks the Model Context Protocol (newline-delimited JSON-RPC 2.0
@@ -2890,6 +2980,10 @@ ${bold("COMMANDS")}
   ${cyan("mcp")}                   run as an MCP server (stdio JSON-RPC) — expose gitmancer tools to IDEs & agents
                     ${dim('read-only by default · GITMANCER_MCP_ALLOW_RUN=1 lifts the run gate')}
   ${cyan("completions")} bash|zsh|fish  print a shell completion script — source it or drop it in your completion dir
+  ${cyan("record")} "<cmd>"          run a command, live + saved as an asciinema .cast session
+                    ${dim('--out <file>   (stderr is merged into the recording)')}
+  ${cyan("replay")} [<file>|--list]    replay a recorded session (or any asciinema v2 cast)
+                    ${dim('--speed 2  --list')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2931,7 +3025,7 @@ ${bold("PLUGINS")} ${dim("(" + PLUGIN_COMMANDS.size + " command" + (PLUGIN_COMMA
   }
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud", "skip-gh", "dry-run"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud", "skip-gh", "dry-run", "list"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -3008,6 +3102,8 @@ async function main() {
     case "mcp-server": return cmdMcp(pos, flags);
     case "completions":
     case "completion": return cmdCompletions(pos, flags);
+    case "record": return cmdRecord(pos, flags);
+    case "replay": return cmdReplay(pos, flags);
     default:
       // plugin-defined commands (#1 #11) win before the ask-fallback
       if (PLUGIN_COMMANDS.has(cmd)) {

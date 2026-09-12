@@ -804,6 +804,45 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
     fs.rmSync("/tmp/_gitmancer_test_completion.sh", { force: true });
   }
 
+  console.log("→ session record & replay (#4): asciinema v2 cast round-trip");
+  {
+    const recHome = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-rec-"));
+    const recEnv = { ...env, HOME: recHome };
+    r = await runCli(["record", "echo hello-record", "--yolo"], tmp, recEnv);
+    check("record echo exits 0", r.status === 0);
+    check("record passes output through live", /hello-record/.test(r.stdout || ""));
+    check("record points at saved session", /session saved/.test(r.stdout || ""));
+    const sessDir = path.join(recHome, ".gitmancer", "sessions");
+    const casts = fs.existsSync(sessDir) ? fs.readdirSync(sessDir).filter((f) => f.endsWith(".cast")) : [];
+    check("record wrote one .cast into sessions dir", casts.length === 1);
+    let castLines = [];
+    if (casts.length) castLines = fs.readFileSync(path.join(sessDir, casts[0]), "utf8").split("\n").filter(Boolean);
+    let hdr = null;
+    let oEvents = 0;
+    for (const l of castLines) {
+      try {
+        const j = JSON.parse(l);
+        if (Array.isArray(j) && j[1] === "o") oEvents++;
+        else if (j && j.version === 2) hdr = j;
+      } catch {}
+    }
+    check("cast header is asciinema v2 with env", !!hdr && !!hdr.env && !!hdr.timestamp);
+    check("cast has output events containing the text", oEvents >= 1 && castLines.some((l) => l.includes("hello-record")));
+    r = await runCli(["replay", casts[0].replace(".cast", "")], tmp, recEnv);
+    check("replay by session name prints recorded output", r.status === 0 && /hello-record/.test(r.stdout || ""));
+    r = await runCli(["replay", "--list"], tmp, recEnv);
+    check("replay --list shows the session", /\.cast/.test(r.stdout || ""));
+    const outCast = path.join(recHome, "explicit.cast");
+    r = await runCli(["record", "echo explicit-run", "--out", outCast, "--yolo"], tmp, recEnv);
+    check("record --out writes custom path", r.status === 0 && fs.existsSync(outCast) && fs.readFileSync(outCast, "utf8").includes("explicit-run"));
+    r = await runCli(["replay", outCast], tmp, recEnv);
+    check("replay custom path works", r.status === 0 && /explicit-run/.test(r.stdout || ""));
+    r = await runCli(["record"], tmp, recEnv);
+    check("record without command fails", r.status !== 0);
+    r = await runCli(["replay", "definitely-missing-xyz"], tmp, recEnv);
+    check("replay of missing session fails cleanly", r.status !== 0 && /not found/.test((r.stderr || "") + (r.stdout || "")));
+  }
+
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
   if (failed.length) {
