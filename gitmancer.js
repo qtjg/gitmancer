@@ -319,6 +319,26 @@ function sseAccumulator(onDelta) {
   };
 }
 
+/* ---------------- usage metering ---------------- */
+
+const USAGE = { calls: 0, prompt: 0, completion: 0, est: 0 };
+const estTokens = (s) => Math.ceil((s || "").length / 4);
+function recordUsage(messages, reply, usage) {
+  USAGE.calls++;
+  if (usage && Number.isFinite(usage.prompt_tokens)) {
+    USAGE.prompt += usage.prompt_tokens;
+    USAGE.completion += usage.completion_tokens || 0;
+  } else {
+    USAGE.est++;
+    USAGE.prompt += estTokens(JSON.stringify(messages || []));
+    USAGE.completion += estTokens(reply && reply.content);
+  }
+}
+function usageLine() {
+  const tot = USAGE.prompt + USAGE.completion;
+  return `usage: ${USAGE.calls} AI call${USAGE.calls === 1 ? "" : "s"} · ~${tot} tokens (${USAGE.prompt} in / ${USAGE.completion} out${USAGE.est ? ", estimated" : ""})`;
+}
+
 async function aiChat(cfg, messages, tools, opts = {}) {
   const chain = [{ aiBase: cfg.aiBase, aiModel: cfg.aiModel, aiKey: cfg.aiKey }];
   for (const fb of cfg.aiFallbacks || []) {
@@ -359,6 +379,7 @@ async function aiChatProvider(cfg, messages, tools, opts = {}) {
     if (res.ok && ctype.includes("text/event-stream")) {
       const acc = sseAccumulator(opts.onDelta);
       await acc.consume(res);
+      recordUsage(messages, acc.message, null);
       return { message: acc.message, streamed: acc.streamed };
     }
     if (!res.ok) res = await fetchRetry(url, req, "AI", 0); // provider may not support streaming — retry buffered once
@@ -376,6 +397,7 @@ async function aiChatProvider(cfg, messages, tools, opts = {}) {
   }
   const choice = json.choices && json.choices[0];
   if (!choice || !choice.message) throw new UserErr(`AI returned no choices: ${capOut(text, 300)}`);
+  recordUsage(messages, choice.message, json.usage || null);
   return { message: choice.message, streamed: false };
 }
 
@@ -749,6 +771,7 @@ function mkCtx(flags, cfg) {
     yolo: !!(flags && flags.yolo),
     noCache: !!(flags && flags["no-cache"]),
     maxSteps: Math.min(Math.max(parseInt(flags && flags.steps, 10) || MAX_STEPS, 1), 100),
+    budget: Math.max(parseInt(flags && flags.budget, 10) || 0, 0),
     always: { value: false },
     cfg,
   };
@@ -760,6 +783,10 @@ function mkCtx(flags, cfg) {
 
 async function agentTurn(cfg, messages, ctx) {
   for (let step = 0; step < (ctx.maxSteps || MAX_STEPS); step++) {
+    if (ctx.budget && USAGE.prompt + USAGE.completion > ctx.budget) {
+      warn(`--budget reached (~${USAGE.prompt + USAGE.completion} tokens) — stopping this run; re-run to continue`);
+      return "budget";
+    }
     let msg;
     let streamed = false;
     try {
@@ -778,6 +805,7 @@ async function agentTurn(cfg, messages, ctx) {
       if (streamed) process.stdout.write("\n\n");
       else console.log((msg.content || dim("(no answer)")) + "\n");
       messages.push({ role: "assistant", content: msg.content || "" });
+      console.log(dim(usageLine()));
       return "done";
     }
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
@@ -845,6 +873,7 @@ async function agentTurn(cfg, messages, ctx) {
     trimHistory(messages);
   }
   warn(`stopped after ${ctx.maxSteps || MAX_STEPS} steps — continue with a follow-up message, or raise --steps`);
+  console.log(dim(usageLine()));
   return "max_steps";
 }
 
@@ -1341,6 +1370,80 @@ function cmdUndo(pos, flags) {
   console.log("");
 }
 
+/* ---------------- prbot: auto-review incoming pull requests ---------------- */
+
+async function cmdPrbot(pos, flags) {
+  const cfg = applyFast(loadConfig(), flags);
+  const root = gitRoot(process.cwd());
+  const repo = (typeof flags.repo === "string" && flags.repo) || (root ? parseOriginRepo(root) : null);
+  if (!repo || !repo.includes("/")) throw new UserErr("usage: gitmancer prbot [--repo owner/name] [--interval 300] [--once] [--yolo]");
+  const journal = path.join(CONFIG_DIR, "prbot.json");
+  let seen = {};
+  try {
+    seen = JSON.parse(fs.readFileSync(journal, "utf8"));
+  } catch {}
+  seen[repo] = seen[repo] || {};
+  const once = !!flags.once;
+  const intervalS = Math.min(Math.max(parseInt(flags.interval, 10) || 300, 30), 3600);
+  banner();
+  console.log(dim(`prbot watching ${repo} — AI-reviews every new pull request${once ? " (single pass)" : ", sweep every " + intervalS + "s"}\n`));
+  do {
+    let prs = [];
+    let fresh = 0;
+    try {
+      prs = await ghPaginate(cfg, `/repos/${repo}/pulls?state=open`, 50);
+    } catch (e) {
+      fail(`prbot: cannot list PRs — ${e.message}`);
+      continue;
+    }
+    for (const p of prs) {
+      const key = String(p.number);
+      const sig = String((p.head && p.head.sha) || (p.head && p.head.ref) || key).slice(0, 12);
+      if (seen[repo][key] === sig) continue; // already reviewed this head
+      fresh++;
+      console.log(cyan(`\n🔎 reviewing #${key}`) + dim(` ${p.title} (${sig})`));
+      try {
+        const diffUrl = p.diff_url || `${cfg.ghBase}/repos/${repo}/pulls/${p.number}`;
+        const diff = await gh(cfg, "GET", diffUrl, undefined, { cache: false });
+        const diffText = typeof diff === "string" ? diff : JSON.stringify(diff, null, 2);
+        const { message } = await aiChat(cfg, [
+          {
+            role: "system",
+            content:
+              "You are a rigorous code reviewer. Review the PR diff. Output markdown:\n" +
+              "1. **Verdict** — APPROVE / REQUEST CHANGES / COMMENT (one line)\n" +
+              "2. **Findings** — bulleted, each prefixed [blocking], [major], [minor] or [nit], with file:line where possible.\n" +
+              "Be concrete. No praise padding. Max ~200 words.",
+          },
+          { role: "user", content: `PR #${p.number}: ${p.title}\nBranch: ${p.head && p.head.ref} → ${p.base && p.base.ref}\n\nDiff:\n${capOut(diffText, 30000)}` },
+        ]);
+        const body = message && message.content ? String(message.content).trim() : "(no review generated)";
+        const ctx = { cwd: root || process.cwd(), yolo: !!flags.yolo, always: { value: false }, cfg };
+        if (await allow(`post review comment on PR #${p.number}`, ctx)) {
+          await gh(cfg, "POST", `/repos/${repo}/issues/${p.number}/comments`, { body });
+          ok(`review posted on #${p.number}`);
+        } else {
+          warn(`skipped posting #${p.number} — review kept local:\n${capOut(body, 800)}`);
+        }
+        seen[repo][key] = sig;
+        try {
+          fs.mkdirSync(CONFIG_DIR, { recursive: true });
+          fs.writeFileSync(journal, JSON.stringify(seen, null, 2));
+        } catch {}
+      } catch (e) {
+        fail(`#${p.number}: ${e.message}`);
+      }
+    }
+    if (!prs.length) console.log(dim("no open pull requests"));
+    else if (!fresh) console.log(dim("no new pull requests — all already reviewed"));
+    if (!once) {
+      console.log(dim(`\nnext sweep in ${intervalS}s — ctrl-c to stop`));
+      await new Promise((r) => setTimeout(r, intervalS * 1000));
+    }
+  } while (!once);
+  console.log("");
+}
+
 /* ---------------- pr: open a pull request (AI-drafted) ---------------- */
 
 function parseOriginRepo(cwd) {
@@ -1676,7 +1779,7 @@ ${bold("COMMANDS")}
   ${cyan("whoami")}                 verify GitHub token — who are you on GitHub? ${dim("--json")}
   ${cyan("repos")}                  list your repositories           ${dim('--limit 50  --json')}
   ${cyan('ask')} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
-                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>')}
+                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>  --budget 200000')}
   ${cyan('fix')} "<cmd>"            run a command; if it fails, the agent auto-fixes the code & re-verifies
                     ${dim('--yolo  --fast  --cwd <dir>')}
   ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
@@ -1701,6 +1804,8 @@ ${bold("COMMANDS")}
   ${cyan("undo")} [n]               revert the last n agent file changes (journal-based, default 1)
   ${cyan("watch")} "<cmd>"          run a command; on failure the agent auto-fixes and re-runs until green
                     ${dim('--max 3  --yolo  --fast')}
+  ${cyan("prbot")}                 watch a repo and AI-review every new pull request
+                    ${dim('--repo owner/name  --interval 300  --once  --yolo')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -1728,7 +1833,7 @@ ${bold("EXAMPLES")}
 `);
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once"]);
 
 function parseArgs(argv) {
   let cmd = null;
@@ -1790,6 +1895,7 @@ async function main() {
     case "memory": return cmdMemory(pos, flags);
     case "undo": return cmdUndo(pos, flags);
     case "watch": return cmdWatch(pos, flags);
+    case "prbot": return cmdPrbot(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
