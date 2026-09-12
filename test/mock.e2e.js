@@ -17,6 +17,8 @@ let aiCalls = 0;
 let fixCalls = 0;
 let paraCalls = 0;
 let mixCalls = 0;
+let undoCalls = 0;
+let batchCalls = 0;
 let userHits = 0;
 let retryTrips = 0;
 let cacheAsks = 0;
@@ -136,6 +138,24 @@ const server = http.createServer((req, res) => {
                 ],
               }
             : { role: "assistant", content: "Done — mixed handled." };
+      } else if (/^memory test$/.test(String(lastUser))) {
+        // memory flow: reply depends on whether GITMANCER.md reached the system prompt
+        const sys = (reqBody.messages || [])[0] || {};
+        message = { role: "assistant", content: String(sys.content || "").includes("RULE-MARKER-123") ? "MEMORY-OK loaded." : "MEMORY-MISS — project memory absent." };
+      } else if (/^undo test$/.test(String(lastUser))) {
+        // undo flow: 1st call → overwrite data.txt, 2nd → final text
+        undoCalls++;
+        message =
+          undoCalls % 2 === 1
+            ? { role: "assistant", content: null, tool_calls: [{ id: `undo_${undoCalls}`, type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "data.txt", content: "OVERWRITTEN" }) } }] }
+            : { role: "assistant", content: "Overwrote data.txt — undo stage one done." };
+      } else if (/^batch test$/.test(String(lastUser))) {
+        // batch_edit flow: 1st call → batch_edit tool call, 2nd → final text
+        batchCalls++;
+        message =
+          batchCalls % 2 === 1
+            ? { role: "assistant", content: null, tool_calls: [{ id: `batch_${batchCalls}`, type: "function", function: { name: "batch_edit", arguments: JSON.stringify({ path: "app.js", edits: [{ find: "var a = 1", replace: "var b = 1" }, { find: "var sum = a + 2", replace: "var sum = b + 2" }] }) } }] }
+            : { role: "assistant", content: "batch done." };
       } else if (aiCalls % 2 === 1) {
         // odd call → request a file write (so both yolo and deny scenarios work)
         message = {
@@ -310,6 +330,50 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("mutating call was gated", /DENIED/.test(r.stdout || ""));
   check("write denied — no file created", !fs.existsSync(path.join(mixDir, "bad.txt")));
   check("final answer after mixed batch", /Done — mixed handled\./.test(r.stdout || ""));
+
+  console.log("→ memory: GITMANCER.md auto-loaded into the system prompt");
+  const memDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-mem-"));
+  fs.writeFileSync(path.join(memDir, "GITMANCER.md"), "Use pnpm. RULE-MARKER-123 always run tests before commit.");
+  r = await runCli(["ask", "memory test", "--yolo"], memDir, env);
+  check("memory ask exits 0", r.status === 0);
+  check("GITMANCER.md content reached system prompt", /MEMORY-OK/.test(r.stdout || ""));
+  check("memory miss not reported", !/MEMORY-MISS/.test(r.stdout || ""));
+  r = await runCli(["memory"], tmp, env);
+  check("memory cmd exits 0", r.status === 0);
+  check("memory cmd creates template", fs.existsSync(path.join(tmp, "GITMANCER.md")) && /Created GITMANCER\.md/.test(r.stdout || ""));
+
+  console.log("→ undo: journal reverts the agent's file change");
+  const undoHome = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-undohome-"));
+  const undoEnv = { ...env, HOME: undoHome };
+  const undoDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-undo-"));
+  fs.writeFileSync(path.join(undoDir, "data.txt"), "ORIGINAL");
+  r = await runCli(["ask", "undo test", "--yolo"], undoDir, undoEnv);
+  check("undo ask exits 0", r.status === 0);
+  check("agent overwrote data.txt", fs.existsSync(path.join(undoDir, "data.txt")) && fs.readFileSync(path.join(undoDir, "data.txt"), "utf8") === "OVERWRITTEN");
+  r = await runCli(["undo"], undoDir, undoEnv);
+  check("undo exits 0", r.status === 0);
+  check("undo restored previous content", fs.existsSync(path.join(undoDir, "data.txt")) && fs.readFileSync(path.join(undoDir, "data.txt"), "utf8") === "ORIGINAL");
+  check("undo reported restored", /restored/.test(r.stdout || ""));
+
+  console.log("→ batch_edit tool: multi-replacement in one call");
+  const batchDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-batch-"));
+  fs.writeFileSync(path.join(batchDir, "app.js"), "var a = 1;\nvar sum = a + 2;\n");
+  r = await runCli(["ask", "batch test", "--yolo"], batchDir, env);
+  check("batch ask exits 0", r.status === 0);
+  check("batch_edit applied replacement", fs.readFileSync(path.join(batchDir, "app.js"), "utf8") === "var b = 1;\nvar sum = b + 2;\n");
+  check("batch final answer shown", /batch done\./.test(r.stdout || ""));
+
+  console.log("→ watch: green on the first run (no agent loop)");
+  r = await runCli(["watch", "node -e 'process.exit(0)'"], tmp, env);
+  check("watch pass exits 0", r.status === 0);
+  check("watch reports first-run green", /green on the first run/.test(r.stdout || ""));
+
+  console.log("→ watch: auto-fix loop turns red into green");
+  const watchDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-watch-"));
+  r = await runCli(["watch", "test -f hello.txt", "--max", "3", "--yolo"], watchDir, env);
+  check("watch auto-fix exits 0", r.status === 0);
+  check("watch fixed then green", /GREEN after \d+ fix rounds?/.test(r.stdout || ""));
+  check("watch created the missing file", fs.existsSync(path.join(watchDir, "hello.txt")));
 
   console.log("→ status --json");
   r = await runCli(["status", "--repo", "acme/widget", "--json"], tmp, env);
