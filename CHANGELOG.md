@@ -3,6 +3,28 @@
 All notable changes to gitmancer are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.4.0] — 2026-09-12
+
+### Added
+- **GITMANCER.md project memory** — repo conventions auto-loaded into the
+  system prompt on every agent run (capped at 1600 chars); new `memory`
+  command creates a starter template (Build & test / Conventions / Do not
+  touch) or shows the current file.
+- **`undo [n]`** — agent file mutations (`write_file`, `batch_edit`) are
+  journaled to `~/.gitmancer/undo-journal.jsonl` with the prior content;
+  `gitmancer undo` restores the last change (deletes files the agent
+  created), `gitmancer undo 5` reverts five. Journal caps at 200 entries.
+- **`watch "<cmd>"`** — auto-fix loop: run command → if it fails, agent
+  diagnoses/fixes/re-verifies → re-runs, up to `--max` attempts (default 3,
+  cap 10). Green on the first run exits immediately.
+- **`batch_edit` agent tool** — several exact string replacements inside one
+  file per call; each `find` must match exactly once unless `replace_all`;
+  confirm-gated like `write_file`, journaled for undo.
+- 18 new e2e checks → 77 total: memory auto-load into the system prompt,
+  memory template creation, undo round-trip (overwrite → restore),
+  batch_edit multi-replacement, watch green-first-run and watch red → AI fix
+  → green loop.
+
 ## [0.3.1] — 2026-09-12
 
 ### Changed

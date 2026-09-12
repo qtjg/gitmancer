@@ -21,10 +21,20 @@ commit: feat(auth): validate signup inputs + rate-limit guard
 ✔ pushed main → origin
 ```
 
-## What's new in v0.3.1 — parallel agent engine
+## What's new in v0.4.0 — memory · undo · watch · batch_edit
+
+- **GITMANCER.md project memory** — drop a file in the repo root with your conventions (build cmds, style rules, "do not touch" zones); it's auto-loaded into the AI's context on every `ask`/`agent`/`fix`/`ship`/`watch` run in that repo. `gitmancer memory` creates a starter template or shows the current one.
+- **`undo`** — every agent file change is journaled to `~/.gitmancer/undo-journal.jsonl` (prior content kept); `gitmancer undo` reverts the last change, `gitmancer undo 5` reverts five. Fearless automation.
+- **`watch "<cmd>"`** — run a command; if it fails the agent auto-fixes the code and re-runs until green (`--max 3` by default). Like `fix`, but loop-tolerant.
+- **`batch_edit` agent tool** — the model can now make several exact string replacements in one file per call instead of rewriting whole files → fewer tokens, faster turns, smaller diffs. Exact-match enforced: a `find` matching multiple locations must pass `replace_all`.
+
+<details>
+<summary>What was new in v0.3.1</summary>
 
 - **Parallel tool dispatch** — when the model batches several read-only tool calls (`list_files` / `read_file` / `github_api` GET), they now run concurrently instead of one-by-one; mutating tools (`write_file`, `run_cmd`, non-GET API) stay sequential behind their confirmation gates, so safety semantics are unchanged
 - **Request coalescing** — identical in-flight GitHub GETs share a single HTTP request (second caller joins the first one's promise) → no duplicate rate-limit burn when parallel calls read the same endpoint
+
+</details>
 
 <details>
 <summary>What was new in v0.3.0</summary>
