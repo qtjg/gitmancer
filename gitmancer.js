@@ -15,7 +15,7 @@ const path = require("path");
 const readline = require("readline");
 const { spawnSync } = require("child_process");
 
-const VERSION = "0.3.1";
+const VERSION = "0.4.0";
 const NAME = "gitmancer";
 const UA = `${NAME}/${VERSION}`;
 const CONFIG_DIR = path.join(os.homedir(), ".gitmancer");
@@ -401,6 +401,10 @@ const TOOLS = [
     path: { type: "string", description: "Relative file path" },
     content: { type: "string", description: "Complete file content to write" },
   }, ["path", "content"]),
+  t("batch_edit", "Make several exact string replacements inside one file in a single call (cheaper than rewriting the whole file). Each 'find' must occur exactly once unless replace_all is set.", {
+    path: { type: "string", description: "Relative file path" },
+    edits: { type: "array", description: "Replacements applied in order", items: { type: "object", properties: { find: { type: "string", description: "Exact text to find" }, replace: { type: "string", description: "Replacement text" }, replace_all: { type: "boolean", description: "Replace every occurrence (default false = must match exactly once)" } }, required: ["find", "replace"] } },
+  }, ["path", "edits"]),
   t("run_cmd", "Run a shell command in the workspace (git, npm, tests, builds, ls, etc.) and get combined stdout+stderr.", {
     command: { type: "string", description: "The shell command to run" },
     timeout_ms: { type: "number", description: "Timeout in milliseconds (default 120000, max 600000). Long installs/builds: 300000." },
@@ -542,9 +546,39 @@ async function runTool(name, args, ctx) {
         if (!(await allow(`write ${rel} (${Buffer.byteLength(String(args.content || ""))} bytes)`, ctx))) {
           return "DENIED by user — do not retry this same write; propose an alternative.";
         }
+        pushUndo({ type: "file", file: abs, prev: fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : null });
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         fs.writeFileSync(abs, String(args.content == null ? "" : args.content));
         return `OK — wrote ${rel} (${fs.statSync(abs).size} bytes)`;
+      }
+
+      case "batch_edit": {
+        const abs = safePath(cwd, args.path);
+        const rel = path.relative(cwd, abs);
+        const edits = Array.isArray(args.edits) ? args.edits : [];
+        if (!edits.length) return "ERROR: edits[] is empty";
+        let src;
+        try {
+          src = fs.readFileSync(abs, "utf8");
+        } catch {
+          return `ERROR: cannot read ${rel} — use write_file to create it first`;
+        }
+        for (let i = 0; i < edits.length; i++) {
+          const find = edits[i] && edits[i].find;
+          const replace = edits[i] && edits[i].replace;
+          if (typeof find !== "string" || !find) return `ERROR: edits[${i}].find must be a non-empty string; nothing changed`;
+          const n = src.split(find).length - 1;
+          if (n === 0) return `ERROR: edits[${i}] — \`${capOut(find, 60)}\` not found in ${rel}; nothing changed`;
+          if (n > 1 && !(edits[i] && edits[i].replace_all)) return `ERROR: edits[${i}] — \`${capOut(find, 60)}\` occurs ${n} times in ${rel}; pass replace_all:true or a longer unique string`;
+          const rep = String(replace == null ? "" : replace);
+          src = edits[i] && edits[i].replace_all ? src.split(find).join(rep) : src.replace(find, rep);
+        }
+        if (!(await allow(`batch-edit ${rel} (${edits.length} replacement${edits.length === 1 ? "" : "s"})`, ctx))) {
+          return "DENIED by user — do not retry this same edit; propose an alternative.";
+        }
+        pushUndo({ type: "file", file: abs, prev: fs.readFileSync(abs, "utf8") });
+        fs.writeFileSync(abs, src);
+        return `OK — ${edits.length} replacement${edits.length === 1 ? "" : "s"} applied to ${rel}`;
       }
 
       case "run_cmd": {
@@ -581,6 +615,28 @@ async function runTool(name, args, ctx) {
 }
 
 /* ---------------- agent loop ---------------- */
+
+function pushUndo(rec) {
+  try {
+    const f = path.join(CONFIG_DIR, "undo-journal.jsonl");
+    let lines = [];
+    try { lines = fs.readFileSync(f, "utf8").split("\n").filter(Boolean); } catch {}
+    lines.push(JSON.stringify({ at: new Date().toISOString(), ...rec }));
+    if (lines.length > 200) lines = lines.slice(-150);
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
+    fs.writeFileSync(f, lines.join("\n") + "\n");
+  } catch {}
+}
+
+function loadMemory(cwd) {
+  try {
+    const txt = fs.readFileSync(path.join(cwd, "GITMANCER.md"), "utf8").trim();
+    return txt ? capOut(txt, 1600) : null;
+  } catch {
+    return null;
+  }
+}
+
 
 function buildSnapshot(cwd) {
   const parts = [];
@@ -629,6 +685,14 @@ function systemPrompt(ctx) {
       "",
       "WORKSPACE SNAPSHOT (auto-generated just now — trust it; skip list_files/read_file when this already answers the question):",
       ctx.snapshot
+    );
+  }
+  const mem = loadMemory(ctx.cwd);
+  if (mem) {
+    lines.push(
+      "",
+      "PROJECT MEMORY (GITMANCER.md in this repo — the user saved these rules for you; follow them exactly):",
+      mem
     );
   }
   return lines.join("\n");
@@ -1156,6 +1220,127 @@ async function cmdFix(pos, flags) {
   console.log("");
 }
 
+/* ---------------- watch: auto-fix loop until a command goes green ---------------- */
+
+async function cmdWatch(pos, flags) {
+  const command = pos.join(" ").trim();
+  if (!command) throw new UserErr('usage: gitmancer watch "<command>"  — e.g. gitmancer watch "npm test"');
+  const maxTries = Math.min(Math.max(parseInt(flags.max, 10) || 3, 1), 10);
+  const cfg = applyFast(loadConfig(), flags);
+  const ctx = mkCtx(flags, cfg);
+  banner();
+  console.log(dim(`watching: $ ${command}  (up to ${maxTries} attempt${maxTries === 1 ? "" : "s"}, auto-fix between runs)\n`));
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    const r = runShell(command, ctx.cwd);
+    if (r.code === 0) {
+      if (attempt === 1) ok("exit 0 — green on the first run ✅");
+      else ok(`exit 0 — GREEN after ${attempt - 1} fix round${attempt - 1 === 1 ? "" : "s"} ⚡`);
+      console.log("");
+      return;
+    }
+    console.log(dim(capOut(r.out || "(no output)", 1500) + "\n"));
+    if (attempt === maxTries) break;
+    warn(`exit ${r.code} (attempt ${attempt}/${maxTries}) — agent auto-fixes, then re-runs…\n`);
+    const messages = [
+      { role: "system", content: systemPrompt(ctx) },
+      {
+        role: "user",
+        content: `While running \`${command}\` (watch mode, attempt ${attempt}), the command failed with exit code ${r.code}.\n\nCombined output:\n${r.out}\n\nDiagnose the root cause, make the minimal correct fix with your tools, then re-run \`${command}\` via run_cmd to verify it exits 0. Do not touch unrelated code.`,
+      },
+    ];
+    await agentTurn(cfg, messages, ctx);
+    console.log(dim("\n── re-running watched command ──"));
+  }
+  fail(`watch: still failing after ${maxTries} attempt${maxTries === 1 ? "" : "s"} — inspect the output above`);
+  console.log("");
+}
+
+/* ---------------- memory: GITMANCER.md project rules ---------------- */
+
+function cmdMemory(pos, flags) {
+  const file = path.join(process.cwd(), "GITMANCER.md");
+  banner();
+  if (fs.existsSync(file)) {
+    const txt = fs.readFileSync(file, "utf8");
+    ok(`GITMANCER.md found (${txt.length} chars) — auto-loaded into the AI's context on every run in this repo`);
+    const lines = txt.split("\n");
+    console.log(dim(lines.slice(0, 15).map((l) => "  │ " + l).join("\n")) + (lines.length > 15 ? dim("\n  │ …") : ""));
+    console.log(dim("\nEdit it anytime to teach the agent your project's rules."));
+    console.log("");
+    return;
+  }
+  const template = [
+    "# GITMANCER.md — project memory",
+    "",
+    "Everything in this file is loaded into gitmancer's AI context on every run",
+    "in this repo. Keep it short and factual — it spends context tokens.",
+    "",
+    "## Build & test",
+    "- Install: `npm install`",
+    "- Test: `npm test`",
+    "",
+    "## Conventions",
+    "- (example: use TypeScript strict mode; prefer named exports)",
+    "",
+    "## Do not touch",
+    "- (example: never edit generated/; don't bump lockfile versions)",
+    "",
+  ].join("\n");
+  fs.writeFileSync(file, template);
+  ok("Created GITMANCER.md — teach the agent your project's rules");
+  console.log(dim("Loaded automatically on every ask/agent/fix/ship/watch run in this repo.\nFill in the Build & test / Conventions / Do not touch sections."));
+  console.log("");
+}
+
+/* ---------------- undo: revert the last agent file changes ---------------- */
+
+function cmdUndo(pos, flags) {
+  const f = path.join(CONFIG_DIR, "undo-journal.jsonl");
+  let lines = [];
+  try {
+    lines = fs.readFileSync(f, "utf8").split("\n").filter(Boolean);
+  } catch {}
+  banner();
+  if (!lines.length) {
+    ok("journal empty — nothing to undo");
+    console.log("");
+    return;
+  }
+  const n = Math.min(Math.max(parseInt(pos[0], 10) || 1, 1), 25);
+  const take = lines.slice(-n).reverse();
+  let done = 0;
+  for (const line of take) {
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (rec.type !== "file" || !rec.file) continue;
+    try {
+      if (rec.prev == null) {
+        if (fs.existsSync(rec.file)) {
+          fs.unlinkSync(rec.file);
+          console.log(`  ↩ removed ${rec.file}`);
+        }
+      } else {
+        fs.writeFileSync(rec.file, rec.prev);
+        console.log(`  ↩ restored ${rec.file}`);
+      }
+      done++;
+    } catch (e) {
+      console.log(`  ✗ ${rec.file}: ${e.message}`);
+    }
+  }
+  lines = lines.slice(0, Math.max(lines.length - n, 0));
+  try {
+    fs.writeFileSync(f, lines.length ? lines.join("\n") + "\n" : "");
+  } catch {}
+  if (done) ok(`undone ${done} file change${done === 1 ? "" : "s"} — journal trimmed`);
+  else warn("nothing restorable in those journal entries (run_cmd actions can't be undone)");
+  console.log("");
+}
+
 /* ---------------- pr: open a pull request (AI-drafted) ---------------- */
 
 function parseOriginRepo(cwd) {
@@ -1512,6 +1697,10 @@ ${bold("COMMANDS")}
   ${cyan("sweep")}                 batch overview of ALL your repos — open issues/PRs per repo, 5-at-a-time
                     ${dim('--limit 30  --json')}
   ${cyan("doctor")}                 diagnose setup: keys, tokens, endpoints, fallbacks — tells you what to fix
+  ${cyan("memory")}                 create/show GITMANCER.md — project rules auto-loaded into every AI run
+  ${cyan("undo")} [n]               revert the last n agent file changes (journal-based, default 1)
+  ${cyan("watch")} "<cmd>"          run a command; on failure the agent auto-fixes and re-runs until green
+                    ${dim('--max 3  --yolo  --fast')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -1598,6 +1787,9 @@ async function main() {
     case "review": return cmdReview(pos, flags);
     case "sweep": return cmdSweep(pos, flags);
     case "doctor": return cmdDoctor();
+    case "memory": return cmdMemory(pos, flags);
+    case "undo": return cmdUndo(pos, flags);
+    case "watch": return cmdWatch(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
