@@ -682,6 +682,43 @@ async function allow(desc, ctx) {
   return ans === "y" || ans === "yes";
 }
 
+/* ---------------- sandbox isolation (#12): wrap run_cmd in docker/bubblewrap ---------------- */
+
+function sandboxProbe() {
+  const forced = String(process.env.GITMANCER_SANDBOX || "").toLowerCase();
+  if (forced === "none") return null;
+  if (forced === "docker" || forced === "bwrap") return forced; // explicit override: trust, don't probe
+  try {
+    const d = spawnSync("docker", ["version", "--format", "ok"], { timeout: 6000, encoding: "utf8" });
+    if (!d.error && /ok/.test(d.stdout || "")) return "docker";
+  } catch {}
+  try {
+    const b = spawnSync("bwrap", ["--version"], { timeout: 4000, encoding: "utf8" });
+    if (!b.error) return "bwrap";
+  } catch {}
+  return null;
+}
+
+function sandboxWrap(command, cwd) {
+  const rt = sandboxProbe();
+  if (!rt) return null;
+  const shEsc = (s) => String(s).replace(/'/g, `'\\''`);
+  if (rt === "docker") {
+    const image = process.env.GITMANCER_SANDBOX_IMAGE || "node:20-alpine";
+    // workspace mounted at the SAME path (paths stay valid); network off; caps on
+    return {
+      runtime: rt,
+      cmd: `docker run --rm -v '${shEsc(cwd)}':'${shEsc(cwd)}' -w '${shEsc(cwd)}' --network=none --memory 2g --cpus 2 -e GIT_TERMINAL_PROMPT=0 ${image} sh -c '${shEsc(command)}'`,
+      cwd,
+    };
+  }
+  return {
+    runtime: rt,
+    cmd: `bwrap --unshare-all --dev-bind / / --bind '${shEsc(cwd)}' '${shEsc(cwd)}' --proc /proc --tmpfs /tmp sh -c '${shEsc(command)}'`,
+    cwd,
+  };
+}
+
 async function runTool(name, args, ctx) {
   const cwd = ctx.cwd;
   try {
@@ -744,14 +781,23 @@ async function runTool(name, args, ctx) {
       case "run_cmd": {
         const command = String(args.command || "").trim();
         if (!command) return "ERROR: empty command";
-        if (!(await allow(`run \`${command}\``, ctx))) {
+        if (!(await allow(`${ctx.sandbox ? "[sandboxed] " : ""}run \`${command}\``, ctx))) {
           return "DENIED by user — do not retry this same command; propose an alternative.";
         }
         const maxMs = Math.min(parseInt(process.env.GITMANCER_CMD_TIMEOUT, 10) || 120000, 600000);
         const tMs = Math.min(Math.max(parseInt(args.timeout_ms, 10) || maxMs, 1000), 600000);
-        const r = runShell(command, cwd, tMs);
+        let finalCmd = command;
+        let cwdUse = ctx.cwd;
+        if (ctx.sandbox) {
+          const wrap = sandboxWrap(command, ctx.cwd);
+          if (!wrap) {
+            return "ERROR: --sandbox requested but no isolation runtime found (install docker or bubblewrap, or set GITMANCER_SANDBOX=docker|bwrap|none). Command NOT run — nothing was executed.";
+          }
+          finalCmd = wrap.cmd;
+        }
+        const r = runShell(finalCmd, cwdUse, tMs);
         if (r.error === "timeout") return `ERROR: command timed out after ${tMs}ms — it was killed. Narrow the scope or raise timeout_ms.`;
-        return `exit ${r.code}\n${r.out || "(no output)"}`;
+        return `exit ${r.code}${ctx.sandbox && finalCmd !== command ? dim(" (sandboxed)") : ""}\n${r.out || "(no output)"}`;
       }
 
       case "github_api": {
@@ -983,6 +1029,7 @@ function mkCtx(flags, cfg) {
   const ctx = {
     cwd: path.resolve((flags && flags.cwd) || process.cwd()),
     yolo: !!(flags && flags.yolo),
+    sandbox: !!(flags && flags.sandbox),
     noCache: !!(flags && flags["no-cache"]),
     maxSteps: Math.min(Math.max(parseInt(flags && flags.steps, 10) || MAX_STEPS, 1), 100),
     budget: Math.max(parseInt(flags && flags.budget, 10) || 0, 0),
@@ -3325,9 +3372,9 @@ ${bold("COMMANDS")}
   ${cyan("whoami")}                 verify GitHub token — who are you on GitHub? ${dim("--json")}
   ${cyan("repos")}                  list your repositories           ${dim('--limit 50  --json')}
   ${cyan('ask')} "<task>"           AI agent: reads/writes code, runs commands, calls GitHub
-                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>  --budget 200000  --resume <id|last>')}
+                    ${dim('--yolo (skip confirmations)  --chat (stay in conversation)  --fast (small model)  --steps 50  --cwd <dir>  --budget 200000  --resume <id|last>  --sandbox')}
   ${cyan('fix')} "<cmd>"            run a command; if it fails, the agent auto-fixes the code & re-verifies
-                    ${dim('--yolo  --fast  --cwd <dir>')}
+                    ${dim('--yolo  --fast  --cwd <dir>  --sandbox')}
   ${cyan("ship")} ["message"]       stage all, AI commit message (if omitted), push current branch
                     ${dim('--no-push (commit locally only)')}
   ${cyan("newrepo")} <name>         create GitHub repo + optionally push a folder in one shot
@@ -3349,7 +3396,7 @@ ${bold("COMMANDS")}
   ${cyan("memory")}                 create/show GITMANCER.md — project rules auto-loaded into every AI run
   ${cyan("undo")} [n]               revert the last n agent file changes (journal-based, default 1)
   ${cyan("watch")} "<cmd>"          run a command; on failure the agent auto-fixes and re-runs until green
-                    ${dim('--max 3  --yolo  --fast')}
+                    ${dim('--max 3  --yolo  --fast  --sandbox')}
   ${cyan("prbot")}                 watch a repo and AI-review every new pull request
                     ${dim('--repo owner/name  --interval 300  --once  --yolo')}
   ${cyan("changelog")} [from]      AI release notes for a commit range (default: since last tag)
@@ -3426,7 +3473,7 @@ ${bold("PLUGINS")} ${dim("(" + PLUGIN_COMMANDS.size + " command" + (PLUGIN_COMMA
   }
 }
 
-const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud", "skip-gh", "dry-run", "list", "keep-going"]);
+const BOOLEAN_FLAGS = new Set(["yolo", "chat", "private", "public", "push", "help", "version", "force", "fast", "no-cache", "json", "no-push", "squash", "rebase", "no-color", "once", "verify", "write", "apply", "draft", "prerelease", "ai", "run", "staged", "loud", "skip-gh", "dry-run", "list", "keep-going", "sandbox"]);
 
 function parseArgs(argv) {
   let cmd = null;

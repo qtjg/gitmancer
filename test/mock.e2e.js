@@ -27,6 +27,7 @@ let plugCalls = 0;
 let diceInTools = false;
 let lastModel = "";
 let exclSeen = false;
+let sbCalls = 0;
 const failed = [];
 
 function check(name, cond) {
@@ -191,6 +192,13 @@ const server = http.createServer((req, res) => {
           plugCalls % 2 === 1
             ? { role: "assistant", content: null, tool_calls: [{ id: "plug_1", type: "function", function: { name: "dice", arguments: JSON.stringify({ sides: 6 }) } }] }
             : { role: "assistant", content: "Plugin dice rolled — custom tools work end to end." };
+      } else if (/sandbox probe/.test(String(lastUser))) {
+        // sandbox flow: 1st call → run_cmd touch marker, 2nd → final text
+        sbCalls++;
+        message =
+          sbCalls % 2 === 1
+            ? { role: "assistant", content: null, tool_calls: [{ id: `sb_${sbCalls}`, type: "function", function: { name: "run_cmd", arguments: JSON.stringify({ command: "touch sandbox-marker.txt" }) } }] }
+            : { role: "assistant", content: "sandbox probe complete." };
       } else if (/resume probe/.test(String(lastUser))) {
         // resume flow: answer depends on how much history arrived
         const mlen = (reqBody.messages || []).length;
@@ -945,6 +953,22 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
     check("resumed context reaches the model (memory answer)", r.status === 0 && /RESUMED-OK/.test(r.stdout || ""));
     r = await runCli(["ask", "--resume", "no-such-session-xyz"], tmp, chatEnv);
     check("--resume of missing id fails cleanly", r.status !== 0 && /not found/.test((r.stderr || "") + (r.stdout || "")));
+  }
+
+  console.log("→ sandbox mode (#12): honest refusal without runtimes, wrap attempt when forced");
+  {
+    const sbDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-sb-"));
+    const noneEnv = { ...env, GITMANCER_SANDBOX: "none" };
+    r = await runCli(["ask", "sandbox probe", "--yolo", "--sandbox"], sbDir, noneEnv);
+    check("sandboxed ask exits 0 (refusal fed back to model)", r.status === 0);
+    check("refusal names the missing runtimes", /no isolation runtime/.test(r.stdout || "") && /docker or bubblewrap/.test(r.stdout || ""));
+    check("command never executed — no marker file", !fs.existsSync(path.join(sbDir, "sandbox-marker.txt")));
+    const dockEnv = { ...env, GITMANCER_SANDBOX: "docker" };
+    r = await runCli(["ask", "sandbox probe", "--yolo", "--sandbox"], sbDir, dockEnv);
+    check("forced docker wrap attempted (error surfaced honestly)", r.status === 0 && /docker/.test((r.stdout || "") + (r.stderr || "")));
+    check("no marker even after failed wrap", !fs.existsSync(path.join(sbDir, "sandbox-marker.txt")));
+    r = await runCli(["ask", "sandbox probe", "--yolo"], sbDir, env);
+    check("without --sandbox the command runs normally", r.status === 0 && fs.existsSync(path.join(sbDir, "sandbox-marker.txt")));
   }
 
   server.close();
