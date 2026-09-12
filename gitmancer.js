@@ -15,7 +15,7 @@ const path = require("path");
 const readline = require("readline");
 const { spawnSync } = require("child_process");
 
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
 const NAME = "gitmancer";
 const UA = `${NAME}/${VERSION}`;
 const CONFIG_DIR = path.join(os.homedir(), ".gitmancer");
@@ -149,18 +149,33 @@ function ghCacheSet(key, data) {
 function ghCacheClear() {
   _ghCache.clear();
 }
+const _ghInflight = new Map(); // coalesce identical in-flight GETs → one HTTP request
 
 async function gh(cfg, method, endpoint, body, opts = {}) {
-  if (!cfg.githubToken) {
-    throw new UserErr("No GitHub token. Run `gitmancer setup` or export GITMANCER_GITHUB_TOKEN.");
-  }
-  method = method.toUpperCase();
+  method = String(method).toUpperCase();
   const cacheable = method === "GET" && opts.cache !== false;
   const ckey = method + " " + endpoint;
   if (cacheable) {
     const hit = ghCacheGet(ckey);
     if (hit !== null) return hit;
+    const pending = _ghInflight.get(ckey);
+    if (pending) return pending; // identical concurrent GETs share one request
   }
+  const p = ghSend(cfg, method, endpoint, body, opts, cacheable, ckey);
+  if (!cacheable) return p;
+  _ghInflight.set(ckey, p);
+  try {
+    return await p;
+  } finally {
+    _ghInflight.delete(ckey);
+  }
+}
+
+async function ghSend(cfg, method, endpoint, body, opts = {}, cacheable = false, ckey = "") {
+  if (!cfg.githubToken) {
+    throw new UserErr("No GitHub token. Run `gitmancer setup` or export GITMANCER_GITHUB_TOKEN.");
+  }
+  method = method.toUpperCase();
   const url = endpoint.startsWith("http") ? endpoint : cfg.ghBase.replace(/\/$/, "") + endpoint;
   let res;
   try {
@@ -702,23 +717,66 @@ async function agentTurn(cfg, messages, ctx) {
       return "done";
     }
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
-    for (const tc of calls) {
-      const name = tc.function && tc.function.name;
-      let args = {};
+    // Read-only tools (list_files / read_file / github_api GET) have no side effects
+    // and never prompt — consecutive batches of them run concurrently. Mutating tools
+    // stay sequential so confirmation order and filesystem effects remain deterministic.
+    const parseTc = (tc) => {
       try {
-        args = JSON.parse((tc.function && tc.function.arguments) || "{}");
-      } catch {}
-      console.log(cyan(`\n⚙ ${name}`) + dim(` ${shortArgs(args)}`));
-      const result = await runTool(name, args, ctx);
-      console.log(
-        dim(
-          capOut(result, 500)
-            .split("\n")
-            .map((l) => "  │ " + l)
-            .join("\n")
-        )
-      );
-      messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+        return JSON.parse((tc.function && tc.function.arguments) || "{}");
+      } catch {
+        return {};
+      }
+    };
+    const isReadonly = (tc) => {
+      const n = tc.function && tc.function.name;
+      if (n === "list_files" || n === "read_file") return true;
+      if (n === "github_api") {
+        try {
+          return String(parseTc(tc).method || "GET").toUpperCase() === "GET";
+        } catch {
+          return true;
+        }
+      }
+      return false;
+    };
+    const groups = [];
+    for (const tc of calls) {
+      const ro = isReadonly(tc);
+      const last = groups[groups.length - 1];
+      if (ro && last && last.ro) last.calls.push(tc);
+      else groups.push({ ro, calls: [tc] });
+    }
+    for (const g of groups) {
+      if (g.ro && g.calls.length > 1) {
+        for (const tc of g.calls) console.log(cyan(`\n⚙ ${tc.function.name}`) + dim(` ${shortArgs(parseTc(tc))} (parallel)`));
+        const results = await Promise.all(g.calls.map((tc) => runTool(tc.function.name, parseTc(tc), ctx)));
+        g.calls.forEach((tc, i) => {
+          console.log(
+            dim(
+              capOut(results[i], 500)
+                .split("\n")
+                .map((l) => "  │ " + l)
+                .join("\n")
+            )
+          );
+          messages.push({ role: "tool", tool_call_id: tc.id, content: results[i] });
+        });
+      } else {
+        const tc = g.calls[0];
+        const name = tc.function && tc.function.name;
+        const args = parseTc(tc);
+        console.log(cyan(`\n⚙ ${name}`) + dim(` ${shortArgs(args)}`));
+        const result = await runTool(name, args, ctx);
+        console.log(
+          dim(
+            capOut(result, 500)
+              .split("\n")
+              .map((l) => "  │ " + l)
+              .join("\n")
+          )
+        );
+        messages.push({ role: "tool", tool_call_id: tc.id, content: result });
+      }
     }
     trimHistory(messages);
   }
