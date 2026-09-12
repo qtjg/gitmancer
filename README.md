@@ -21,7 +21,13 @@ commit: feat(auth): validate signup inputs + rate-limit guard
 ✔ pushed main → origin
 ```
 
-## What's new in v0.3.0 — speed & account-scale
+## What's new in v0.3.1 — parallel agent engine
+
+- **Parallel tool dispatch** — when the model batches several read-only tool calls (`list_files` / `read_file` / `github_api` GET), they now run concurrently instead of one-by-one; mutating tools (`write_file`, `run_cmd`, non-GET API) stay sequential behind their confirmation gates, so safety semantics are unchanged
+- **Request coalescing** — identical in-flight GitHub GETs share a single HTTP request (second caller joins the first one's promise) → no duplicate rate-limit burn when parallel calls read the same endpoint
+
+<details>
+<summary>What was new in v0.3.0</summary>
 
 - **Retry + fallback chain** — transient AI errors (429/5xx) retry with exponential backoff (respects `Retry-After`); add `aiFallbacks` to your config and gitmancer fails over to the next provider/model instead of dying
 - **GitHub GET cache** — identical API reads are served from a 10-minute in-process cache (mutations invalidate it, `--no-cache` bypasses) → sweeps and status views are dramatically faster and burn less rate limit
@@ -32,6 +38,8 @@ commit: feat(auth): validate signup inputs + rate-limit guard
 - **Context compaction v2** — long sessions compact safely at user-message boundaries (never mid tool-call), so marathon agent turns stay fast
 - **Agent tool upgrades** — `run_cmd` gains a `timeout_ms` guard, `read_file` gains `offset`/`limit` pagination for big files
 - **`--json` output** for `status` and `sweep` — pipe into `jq`, drive from scripts
+
+</details>
 
 <details>
 <summary>What was new in v0.2.0</summary>

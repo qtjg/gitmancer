@@ -3,7 +3,25 @@
 All notable changes to gitmancer are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [0.3.1] — 2026-09-12
+
+### Changed
+- **Speed: parallel tool dispatch** — when the model batches several read-only
+  tool calls (`list_files` / `read_file` / `github_api` GET), they now run
+  concurrently instead of one-by-one. Mutating tools (`write_file`, `run_cmd`,
+  non-GET API calls) still execute sequentially behind their confirmation
+  gates, so confirmation order and filesystem effects stay deterministic.
+- **Speed: request coalescing** — identical in-flight GitHub GETs now share a
+  single HTTP request (the second caller joins the first one's promise),
+  removing duplicate rate-limit spend when parallel calls read the same
+  endpoint; the 10-minute TTL cache still sits in front of everything.
+
+### Added
+- 10 new e2e checks (41 → 51): parallel batch executes all reads with order
+  preserved, mixed batches keep mutating tools confirm-gated, and the
+  identical-GET cache check now also proves coalescing under concurrency.
+
+## [0.3.0] — 2026-09-11
 
 ### Added
 - `pr list | close | merge` — full PR lifecycle from the terminal: list with
