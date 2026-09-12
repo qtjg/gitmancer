@@ -159,6 +159,9 @@ const server = http.createServer((req, res) => {
       } else if (/Keep-a-Changelog/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
         // changelog/release release-notes flow → deterministic markdown
         message = { role: "assistant", content: "### Added\n- MOCK-NOTE feature one (abc1234)\n### Fixed\n- MOCK-NOTE crash on start (def5678)" };
+      } else if (/receipts verify test/.test(String(lastUser))) {
+        // ask --verify flow: cite one real file:line and one broken reference
+        message = { role: "assistant", content: "The adder lives in `calc.js:1`; the old helper was `missing.js:9`." };
       } else if (/hello2/.test(String(lastUser))) {
         // budget flow: always demand a write so the budget check trips on the next step
         message = { role: "assistant", content: null, tool_calls: [{ id: "bud1", type: "function", function: { name: "write_file", arguments: JSON.stringify({ path: "hello2.txt", content: "budget" }) } }] };
@@ -348,6 +351,15 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   r = await runCli(["memory"], tmp, env);
   check("memory cmd exits 0", r.status === 0);
   check("memory cmd creates template", fs.existsSync(path.join(tmp, "GITMANCER.md")) && /Created GITMANCER\.md/.test(r.stdout || ""));
+
+  console.log("→ ask --verify: file:line receipts checked against the worktree");
+  const verDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-verify-"));
+  fs.writeFileSync(path.join(verDir, "calc.js"), "function add(a, b) {\n  return a + b;\n}\n");
+  r = await runCli(["ask", "receipts verify test", "--verify", "--yolo"], verDir, env);
+  check("verify ask exits 0", r.status === 0);
+  check("receipt verdict printed", /receipts: 2 cited — 1 verified, 1 broken/.test(r.stdout || ""));
+  check("broken receipt named", /✗.*missing\.js:9 — file not found/.test(r.stdout || ""));
+  check("only the broken receipt flagged", ((r.stdout || "").match(/✗/g) || []).length === 1);
 
   console.log("→ undo: journal reverts the agent's file change");
   const undoHome = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-undohome-"));

@@ -1018,6 +1018,51 @@ async function cmdAsk(pos, flags) {
   console.log(dim("\nbye ⚡"));
 }
 
+/* ---------------- ask --verify: mechanically check every file:line receipt ---------------- */
+
+async function verifyReceipts(messages, cwd) {
+  const texts = messages.filter((m) => m.role === "assistant" && m.content).map((m) => String(m.content));
+  const RE = /(^|[^\w./\-])([A-Za-z0-9_\-./\\]+\.[A-Za-z]{1,5})(?::(\d+)|#L(\d+))?/g;
+  const seen = new Map();
+  for (const txt of texts) {
+    for (const m of txt.matchAll(RE)) {
+      const file = m[2].replace(/\\/g, "/");
+      const known =
+        file.includes("/") ||
+        /\.(js|mjs|cjs|jsx|ts|tsx|py|rb|go|rs|java|php|css|scss|html|json|md|yml|yaml|toml|sh|txt|sql|swift|kt|c|cpp|h|vue|svelte)$/.test(file);
+      if (!known) continue;
+      const line = Number(m[3] || m[4] || 0) || 0;
+      const key = file + ":" + line;
+      if (!seen.has(key)) seen.set(key, { file, line });
+    }
+  }
+  const refs = [...seen.values()].slice(0, 40);
+  if (!refs.length) return;
+  let good = 0;
+  const broken = [];
+  for (const r of refs) {
+    const abs = path.resolve(cwd, r.file);
+    let valid = false;
+    let why = "";
+    try {
+      if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+        if (!r.line || r.line <= fs.readFileSync(abs, "utf8").split("\n").length) valid = true;
+        else why = "line beyond end of file";
+      } else why = "file not found";
+    } catch {
+      why = "unreadable";
+    }
+    if (valid) good++;
+    else broken.push(`  ${red("✗")} ${r.file}${r.line ? ":" + r.line : ""} — ${why}`);
+  }
+  console.log("");
+  if (!broken.length) ok(`receipts: ${refs.length} cited — all verified ✔`);
+  else {
+    warn(`receipts: ${refs.length} cited — ${good} verified, ${broken.length} broken:`);
+    for (const b of broken) console.log(b);
+  }
+}
+
 /* ---------------- git plumbing ---------------- */
 
 function gitOut(args, cwd, ...redactSecrets) {
