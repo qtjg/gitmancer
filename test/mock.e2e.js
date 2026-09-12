@@ -159,6 +159,9 @@ const server = http.createServer((req, res) => {
       } else if (/Keep-a-Changelog/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
         // changelog/release release-notes flow → deterministic markdown
         message = { role: "assistant", content: "### Added\n- MOCK-NOTE feature one (abc1234)\n### Fixed\n- MOCK-NOTE crash on start (def5678)" };
+      } else if (/\[gitmancer testgen\]/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
+        // testgen flow: deterministic test-file content (wrapped in fences to exercise stripping)
+        message = { role: "assistant", content: "```js\n// MOCK-TEST generated\nconst test = require('node:test');\n```" };
       } else if (/receipts verify test/.test(String(lastUser))) {
         // ask --verify flow: cite one real file:line and one broken reference
         message = { role: "assistant", content: "The adder lives in `calc.js:1`; the old helper was `missing.js:9`." };
@@ -551,6 +554,18 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   spawnSync("git", ["add", "clean.txt"], { cwd: secDir });
   r = await runCli(["secscan", "--staged"], secDir, env);
   check("secscan --staged clean exits 0", r.status === 0 && /clean — no secrets/.test(r.stdout || ""));
+
+  console.log("→ testgen: AI writes unit tests (preview vs --yolo write)");
+  const tgDir = fs.mkdtempSync(path.join(os.tmpdir(), "gitmancer-tg-"));
+  fs.writeFileSync(path.join(tgDir, "calc.js"), "function add(a, b) {\n  return a + b;\n}\nmodule.exports = { add };\n");
+  r = await runCli(["testgen", "calc.js"], tgDir, env);
+  check("testgen preview exits 0", r.status === 0);
+  check("testgen preview prints tests, writes nothing", /MOCK-TEST generated/.test(r.stdout || "") && !fs.existsSync(path.join(tgDir, "calc.test.js")));
+  r = await runCli(["testgen", "calc.js", "--yolo"], tgDir, env);
+  check("testgen --yolo exits 0", r.status === 0);
+  const tgFile = path.join(tgDir, "calc.test.js");
+  check("testgen --yolo writes test file", fs.existsSync(tgFile) && /MOCK-TEST generated/.test(fs.readFileSync(tgFile, "utf8")));
+  check("testgen strips markdown fences", !fs.readFileSync(tgFile, "utf8").includes("```"));
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });

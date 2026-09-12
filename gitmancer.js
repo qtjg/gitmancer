@@ -1900,6 +1900,53 @@ async function cmdSecscan(pos, flags) {
   process.exitCode = res.findings.length ? 1 : 0;
 }
 
+/* ---------------- testgen: AI unit-test generation for a source file ---------------- */
+
+async function cmdTestgen(pos, flags) {
+  const cfg = applyFast(loadConfig(), flags);
+  banner();
+  const target = pos[0];
+  if (!target) throw new UserErr("usage: gitmancer testgen <file> [--write]  — AI-generates unit tests for a source file");
+  const abs = path.resolve(process.cwd(), target);
+  if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) throw new UserErr(`file not found: ${target}`);
+  const src = fs.readFileSync(abs, "utf8");
+  const ext = (path.extname(abs).replace(".", "").toLowerCase()) || "txt";
+  const runnerHint = {
+    js: "node:test + assert (zero-dependency); use require or ESM imports whichever the file uses",
+    mjs: "node:test + assert (ESM imports)",
+    cjs: "node:test + assert (CommonJS require)",
+    ts: "vitest (fallback jest) — output TypeScript",
+    tsx: "vitest (fallback jest) — output TypeScript",
+    py: "pytest with plain test functions",
+  }[ext] || "the language's standard test framework";
+  const { message } = await aiChat(cfg, [
+    {
+      role: "system",
+      content:
+        "You are a test engineer. Write thorough unit tests for the given source file using " +
+        runnerHint +
+        ". Cover happy paths, edge cases and error paths. Output ONLY the test file content — no explanations, no markdown fences. [gitmancer testgen]",
+    },
+    { role: "user", content: `File: ${path.basename(abs)}\n\n${capOut(src, 12000)}` },
+  ]);
+  const code = String((message && message.content) || "")
+    .replace(/```[a-z]*\n?/g, "")
+    .replace(/```/g, "")
+    .trim();
+  if (!code) throw new UserErr("AI returned empty tests — check your AI key/model");
+  const base = path.basename(abs).replace(/\.[^.]+$/, "");
+  const testExt = ext === "ts" || ext === "tsx" ? "ts" : ext === "py" ? "py" : "js";
+  const testRel = path.join(path.dirname(target), `${base}.test.${testExt}`);
+  if (flags.write || flags.yolo) {
+    fs.writeFileSync(path.resolve(process.cwd(), testRel), code + "\n");
+    ok(`tests written → ${testRel} (${code.split("\n").length} lines)`);
+    console.log(dim(`run them: ${testExt === "py" ? `pytest ${testRel}` : `node --test ${testRel}`}`));
+  } else {
+    console.log(code);
+    console.log(dim(`\n(dry preview — pass --write or --yolo to save as ${testRel})`));
+  }
+}
+
 /* ---------------- review: AI code review of a pull request ---------------- */
 
 async function cmdReview(pos, flags) {
@@ -2132,6 +2179,8 @@ ${bold("COMMANDS")}
                     ${dim('bump version + CHANGELOG + tag + push + GitHub release  --no-push  --skip-gh  --dry-run')}
   ${cyan("secscan")}               scan tracked files (or --staged) for API keys & secrets — exit 1 if found
                     ${dim('--staged  --path <p>  --json')}
+  ${cyan("testgen")} <file>        AI-generates unit tests for a source file (dry preview; --write to save)
+                    ${dim('--write  --yolo  --fast')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2227,6 +2276,7 @@ async function main() {
     case "changelog": return cmdChangelog(pos, flags);
     case "release": return cmdRelease(pos, flags);
     case "secscan": return cmdSecscan(pos, flags);
+    case "testgen": return cmdTestgen(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);
