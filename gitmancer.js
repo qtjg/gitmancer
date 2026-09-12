@@ -2083,6 +2083,70 @@ async function cmdFleet(pos, flags) {
   } else ok(`all ${rows.length} repo(s) ${action} ok`);
 }
 
+/* ---------------- triage: AI classification of open issues ---------------- */
+
+async function aiTriageIssue(cfg, issue) {
+  const body = capOut(String(issue.body || "(no body)"), 2500);
+  const { message } = await aiChat(cfg, [
+    {
+      role: "system",
+      content:
+        'You triage GitHub issues. Reply with ONLY a JSON object: {"priority":"P0|P1|P2|P3","type":"bug|feature|question|docs","label":"a concise label","rationale":"max 12 words"}. [gitmancer triage]',
+    },
+    { role: "user", content: `Issue #${issue.number}: ${issue.title}\n\n${body}` },
+  ]);
+  const raw = String((message && message.content) || "");
+  const m = raw.match(/\{[\s\S]*\}/);
+  if (!m) throw new UserErr("AI returned no JSON for an issue");
+  const j = JSON.parse(m[0]);
+  if (!j.priority || !j.type || !j.label) throw new UserErr("AI triage JSON incomplete");
+  return j;
+}
+
+async function cmdTriage(pos, flags) {
+  const cfg = applyFast(loadConfig(), flags);
+  if (!flags.json) banner();
+  const slug = ((typeof flags.repo === "string" && flags.repo) || pos[0] || "").replace(/^https?:\/\/github\.com\//, "");
+  if (!/^[\w.-]+\/[\w.-]+$/.test(slug)) throw new UserErr("usage: gitmancer triage <owner/repo> [--apply] [--limit 20] [--json]");
+  const limit = Math.min(parseInt(flags.limit, 10) || 20, 50);
+  const issues = (await ghPaginate(cfg, `/repos/${slug}/issues?state=open&per_page=50`, limit))
+    .filter((i) => !i.pull_request)
+    .slice(0, limit);
+  if (!issues.length) return ok(`no open issues in ${slug}`);
+  if (!flags.json) console.log(dim(`triaging ${issues.length} open issue(s) in ${slug}…\n`));
+  const out = [];
+  for (const issue of issues) {
+    let t;
+    try {
+      t = await aiTriageIssue(cfg, issue);
+    } catch (e) {
+      t = { priority: "?", type: "?", label: "?", rationale: String(e.message).slice(0, 60) };
+    }
+    out.push({ number: issue.number, title: issue.title, priority: t.priority, type: t.type, label: t.label, rationale: t.rationale });
+  }
+  if (flags.json) return console.log(JSON.stringify(out, null, 2));
+  for (const t of out) {
+    const pr = t.priority === "P0" ? red(t.priority) : t.priority === "P1" ? yellow(t.priority) : cyan(t.priority);
+    console.log(`  ${pr}  ${bold(`#${t.number}`)}  ${t.type}  ${t.title}  ${dim(`— ${t.rationale} [${t.label}]`)}`);
+  }
+  if (flags.apply) {
+    const targets = out.filter((t) => t.label && t.label !== "?");
+    if (!targets.length) return warn("nothing to label");
+    const ans = flags.yolo ? "y" : ((await askUser(`${yellow(`apply labels to ${targets.length} issue(s)?`)} [y/N] `)) ?? "").trim().toLowerCase();
+    if (ans !== "y" && ans !== "yes") return info("skipped — nothing applied");
+    for (const t of targets) {
+      try {
+        await gh(cfg, "POST", `/repos/${slug}/issues/${t.number}/labels`, { labels: [t.label] });
+        ok(`labeled #${t.number} → ${t.label}`);
+      } catch (e) {
+        warn(`label #${t.number} failed: ${e.message}`);
+      }
+    }
+  } else {
+    console.log(dim("\ndry run — pass --apply to write labels to GitHub"));
+  }
+}
+
 /* ---------------- review: AI code review of a pull request ---------------- */
 
 async function cmdReview(pos, flags) {
@@ -2321,6 +2385,8 @@ ${bold("COMMANDS")}
                     ${dim('explain app.js · explain HEAD~1..HEAD · explain "git rebase --onto"')}
   ${cyan("fleet")} <action>        run one action across every repo directly under --root
                     ${dim('status | pull | secscan | run "<cmd>"   --root <dir>  --json')}
+  ${cyan("triage")} <owner/repo>   AI triage of open issues — priority/type/label + rationale
+                    ${dim('--apply (write labels)  --limit 20  --json  --yolo')}
   ${cyan("help")} / ${cyan("version")}
 
 ${bold("PROVIDERS")}
@@ -2419,6 +2485,7 @@ async function main() {
     case "testgen": return cmdTestgen(pos, flags);
     case "explain": return cmdExplain(pos, flags);
     case "fleet": return cmdFleet(pos, flags);
+    case "triage": return cmdTriage(pos, flags);
     default:
       // shorthand: gitmancer "do a thing" → ask
       return cmdAsk([cmd, ...pos], flags);

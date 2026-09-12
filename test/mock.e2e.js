@@ -22,6 +22,7 @@ let batchCalls = 0;
 let userHits = 0;
 let retryTrips = 0;
 let cacheAsks = 0;
+let labelPosts = 0;
 const failed = [];
 
 function check(name, cond) {
@@ -167,6 +168,9 @@ const server = http.createServer((req, res) => {
         const sys0 = String((((reqBody.messages || [])[0]) || {}).content || "");
         const em = (/\[explain:(\w+)\]/.exec(sys0) || [])[1] || "?";
         message = { role: "assistant", content: `EXPLAIN-OK (${em}) — mock explanation.` };
+      } else if (/\[gitmancer triage\]/.test(String((((reqBody.messages || [])[0]) || {}).content || ""))) {
+        // triage flow: deterministic JSON classification
+        message = { role: "assistant", content: '{"priority":"P1","type":"bug","label":"bug · P1","rationale":"mock crash on start"}' };
       } else if (/receipts verify test/.test(String(lastUser))) {
         // ask --verify flow: cite one real file:line and one broken reference
         message = { role: "assistant", content: "The adder lives in `calc.js:1`; the old helper was `missing.js:9`." };
@@ -200,6 +204,15 @@ const server = http.createServer((req, res) => {
       respond(res, { number: 7, state: "closed", html_url: "https://github.com/acme/widget/pull/7" });
     } else if (req.method === "PATCH" && req.url.endsWith("/issues/5")) {
       respond(res, { number: 5, state: "open", html_url: "https://github.com/acme/widget/issues/5" });
+    } else if (req.url.startsWith("/repos/acme/widget/issues?")) {
+      respond(res, [
+        { number: 101, title: "Crash on start", body: "TypeError: cannot read property x of undefined", user: { login: "maya" } },
+        { number: 102, title: "Add dark mode", body: "It would be nice to have a dark theme.", user: { login: "maya" }, pull_request: { url: "http://x" } },
+        { number: 103, title: "Docs unclear", body: "README step 3 is confusing.", user: { login: "maya" } },
+      ]);
+    } else if (req.method === "POST" && /\/repos\/acme\/widget\/issues\/\d+\/labels$/.test(req.url)) {
+      labelPosts++;
+      respond(res, [{ name: "bug · P1" }]);
     } else if (req.url.startsWith("/repos/acme/widget/pulls?")) {
       respond(res, [{ number: 7, title: "Add widget", user: { login: "mayank-test" }, head: { ref: "feature" }, draft: false, html_url: "https://github.com/acme/widget/pull/7" }]);
     } else if (req.method === "POST" && req.url.endsWith("/pulls")) {
@@ -622,6 +635,19 @@ function runCli(args, cwd, env, timeoutMs, stdinData) {
   check("fleet run executed per repo", (r.stdout || "").split("hi").length - 1 >= 2);
   r = await runCli(["fleet", "banana", "--root", fleetRoot], fleetRoot, env);
   check("fleet rejects unknown action", r.status !== 0);
+
+  console.log("→ triage: AI classifies open issues, --apply labels them");
+  r = await runCli(["triage", "acme/widget", "--json"], tmp, env);
+  check("triage exits 0", r.status === 0);
+  j = null;
+  try { j = JSON.parse(r.stdout); } catch {}
+  check("triage --json filters PRs and classifies", Array.isArray(j) && j.length === 2 && j[0].number === 101 && j[0].priority === "P1");
+  r = await runCli(["triage", "acme/widget", "--apply", "--yolo"], tmp, env);
+  check("triage --apply exits 0", r.status === 0);
+  check("triage labeled the issues", /labeled #101/.test(r.stdout || "") && /labeled #103/.test(r.stdout || ""));
+  check("labels POSTed to GitHub", labelPosts >= 2);
+  r = await runCli(["triage", "acme/widget"], tmp, env);
+  check("triage dry run says so", /dry run/.test(r.stdout || ""));
 
   server.close();
   fs.rmSync(tmp, { recursive: true, force: true });
