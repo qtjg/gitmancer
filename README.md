@@ -6,7 +6,7 @@ Give it any OpenAI-compatible AI key (Groq / OpenAI / OpenRouter / Z.ai / Ollama
 GitHub token, and it becomes a terminal-native agent that reads and writes your code, runs
 commands, commits, pushes, creates repos, and manages issues — you talk, it ships.
 
-![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![deps](https://img.shields.io/badge/dependencies-0-blue) ![license](https://img.shields.io/badge/license-MIT-orange) ![version](https://img.shields.io/badge/version-0.3.0-purple)
+![node](https://img.shields.io/badge/node-%3E%3D18-brightgreen) ![deps](https://img.shields.io/badge/dependencies-0-blue) ![license](https://img.shields.io/badge/license-MIT-orange) ![version](https://img.shields.io/badge/version-0.5.0-purple)
 
 ```bash
 $ gitmancer ask "add input validation to signup.js and run the tests"
@@ -21,7 +21,20 @@ commit: feat(auth): validate signup inputs + rate-limit guard
 ✔ pushed main → origin
 ```
 
-## What's new in v0.4.0 — memory · undo · watch · batch_edit
+## What's new in v0.5.0 — release autopilot · security · fleet · triage
+
+- **`changelog` / `release`** — AI release notes from any commit range (Keep-a-Changelog style); `release patch|minor|major` bumps the version, writes the CHANGELOG section, commits, tags and (optionally) pushes + publishes the GitHub Release in one shot (`--no-push` / `--skip-gh` / `--dry-run` escapes).
+- **`ask --verify`** — the agent must cite file:line receipts; every citation is mechanically re-checked against the worktree and broken ones are flagged.
+- **`secscan`** — gitleaks-style secret scanning: 7 rule families (AWS/GitHub/OpenAI/Slack/Google keys, private key blocks, hard-coded secrets), placeholder-aware, previews redacted, `--staged` / `--path` / `--json`, exit 1 when findings → CI/hook friendly.
+- **`hook install pre-commit|pre-push|commit-msg`** — installs a managed, idempotent git-hook block that runs `secscan` (fail-closed, fail-open if gitmancer isn't on PATH); `hook list` / `hook uninstall` keep user code intact.
+- **`testgen <file>`** — AI-generated unit tests for any source file, framework hinted per language (node:test / vitest / pytest); dry preview by default, `--write` / `--yolo` saves.
+- **`explain <target>`** — AI explains a file, a git rev or rev-range (`HEAD~1..HEAD`), or a shell command — target mode auto-detected.
+- **`fleet`** — run one action (`status` / `pull` / `secscan` / `run "<cmd>"`) across every repo directly under a root directory, sorted, with `--json` and a failing exit code if any repo fails.
+- **`triage <owner/repo>`** — AI triage of open issues: P0–P3 priority, type, label + one-line rationale; `--apply` writes labels to GitHub (confirm-gated).
+- e2e suite grew to **138 checks** — all green.
+
+<details>
+<summary>What was new in v0.4.0 — memory · undo · watch · batch_edit · prbot</summary>
 
 - **GITMANCER.md project memory** — drop a file in the repo root with your conventions (build cmds, style rules, "do not touch" zones); it's auto-loaded into the AI's context on every `ask`/`agent`/`fix`/`ship`/`watch` run in that repo. `gitmancer memory` creates a starter template or shows the current one.
 - **`undo`** — every agent file change is journaled to `~/.gitmancer/undo-journal.jsonl` (prior content kept); `gitmancer undo` reverts the last change, `gitmancer undo 5` reverts five. Fearless automation.
@@ -29,6 +42,8 @@ commit: feat(auth): validate signup inputs + rate-limit guard
 - **`batch_edit` agent tool** — the model can now make several exact string replacements in one file per call instead of rewriting whole files → fewer tokens, faster turns, smaller diffs. Exact-match enforced: a `find` matching multiple locations must pass `replace_all`.
 - **`prbot`** — watches a repo and AI-reviews every new pull request automatically (`--repo owner/name`, `--interval 300` sweep, `--once` for CI/single pass). Remembers reviewed heads in `~/.gitmancer/prbot.json`, posts severity-tagged verdicts as PR comments (confirm-gated unless `--yolo`).
 - **Token metering + `--budget`** — every run now prints a `usage:` line (AI calls · tokens in/out, real numbers when the provider reports usage, estimates otherwise); `ask --budget 200000` stops the agent loop when the soft cap is hit.
+
+</details>
 
 <details>
 <summary>What was new in v0.3.1</summary>
@@ -130,6 +145,18 @@ never printed (last 4 chars only), and never sent anywhere except their own APIs
 | `gitmancer status` | dashboard: branch, dirty files, sync state, open issues/PRs, CI (`--json`) |
 | `gitmancer sweep` | batch overview of all your repos — open counts per repo (`--json`) |
 | `gitmancer doctor` | diagnose config, keys, endpoints, fallbacks |
+| `gitmancer memory` | create/show GITMANCER.md — repo rules auto-loaded into every AI run |
+| `gitmancer undo [n]` | revert the last n agent file changes (journal-based) |
+| `gitmancer watch "<cmd>"` | run → fail → agent auto-fixes → re-run until green |
+| `gitmancer prbot` | watch a repo and AI-review every new pull request |
+| `gitmancer changelog [from]` | AI release notes for a commit range (`--write` updates CHANGELOG.md) |
+| `gitmancer release patch\|minor\|major` | bump + CHANGELOG + tag + push + GitHub release in one shot |
+| `gitmancer secscan` | scan for API keys & secrets — exit 1 if found (`--staged`, `--json`) |
+| `gitmancer hook install pre-commit` | managed git hook running secscan on every commit/push |
+| `gitmancer testgen <file>` | AI unit tests for a source file (`--write` to save) |
+| `gitmancer explain <target>` | AI explains a file, diff/range, or command |
+| `gitmancer fleet <action>` | status/pull/secscan/run across every repo under `--root` |
+| `gitmancer triage <owner/repo>` | AI triage of open issues (`--apply` writes labels) |
 
 **Useful flags:** `--yolo` (skip confirmations for unattended runs) · `--fast` (small model per preset) · `--no-cache` (bypass GitHub GET cache) · `--json` · `--private` · `--limit N` · `--cwd <dir>`
 

@@ -3,6 +3,36 @@
 All notable changes to gitmancer are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning: [SemVer](https://semver.org/).
 
+## [0.5.0] — 2026-09-12
+
+### Added
+- **`changelog [from]`** — AI release notes (Keep-a-Changelog style) for a commit
+  range, default since the last tag; `--write` prepends a section to
+  CHANGELOG.md, `--json` for scripting.
+- **`release patch|minor|major`** — one-shot version bump: package.json bump,
+  CHANGELOG section, `chore(release): vX.Y.Z` commit, tag, `--push --follow-tags`,
+  and a GitHub Release via the API; `--no-push` / `--skip-gh` / `--dry-run` escapes.
+- **`ask --verify`** — mechanically re-checks every `file:line` receipt the agent
+  cites against the worktree; broken references are flagged with reasons.
+- **`secscan`** — gitleaks-style secret scanning over tracked files, `--staged`
+  diffs or a single `--path`: AWS / GitHub / OpenAI / Slack / Google key rules,
+  private-key blocks and hard-coded secret assignments; placeholder-aware,
+  redacted previews, `--json`, exit 1 on findings for CI/hook use.
+- **`hook list|install|uninstall`** — managed, idempotent git-hook blocks
+  (pre-commit / pre-push / commit-msg) that run secscan; existing user hooks are
+  preserved (append or `--force`), uninstall keeps user code.
+- **`testgen <file>`** — AI unit-test generation with per-language framework
+  hints (node:test / vitest / pytest); dry preview by default, `--write` / `--yolo`.
+- **`explain <target>`** — AI explanations with auto-detected target mode:
+  source file, git rev or rev-range, or shell command.
+- **`fleet status|pull|secscan|run "<cmd>"`** — one action across every repo
+  directly under `--root`; sorted rows, `--json`, non-zero exit when any repo fails.
+- **`triage <owner/repo>`** — AI triage of open issues (P0–P3 priority, type,
+  label + rationale); `--apply` writes labels via the API, confirm-gated.
+
+### Changed
+- e2e suite extended to 138 checks — all green.
+
 ## [0.4.0] — 2026-09-12
 
 ### Added
