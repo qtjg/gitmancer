@@ -1,5 +1,10 @@
 # ⚡ gitmancer
 
+<p align="center">
+  <img src="docs/assets/3d-banner.svg" alt="gitmancer 3D banner" width="880" />
+</p>
+
+
 <!-- ⬡ 3D-UPGRADE v1 by Mayank Bhaskar -->
 <div align="center">
 
@@ -265,6 +270,22 @@ If the primary fails, gitmancer walks the chain and tells you which fallback ser
 ## Contributing
 
 PRs welcome — keep it zero-dependency and single-file, that's the whole point. Read [CONTRIBUTING.md](CONTRIBUTING.md), then: `node --check gitmancer.js && node test/mock.e2e.js` (no keys needed). Found a security issue? See [SECURITY.md](SECURITY.md).
+
+
+---
+
+## 🧊 3D Visuals
+
+<p align="center">
+  <img src="docs/assets/3d-langs.svg" alt="gitmancer — 3D language stack" width="800" />
+</p>
+
+Isometric 3D language stack computed from live GitHub language stats.
+Regenerate the graphics any time with the built-in generator — stdlib only, zero dependencies:
+
+```bash
+python tools/generate_3d_assets.py
+```
 
 ## License
 
