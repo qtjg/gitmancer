@@ -2,3 +2,23 @@ node_modules/
 *.log
 .env
 .DS_Store
+
+# TypeScript
+*.tsbuildinfo
+
+.eslintcache
+
+
+# Coverage
+coverage/
+
+
+# Node version managers
+.node-version
+
+.python-version
+
+
+# Python
+__pycache__/
+*.py[cod]
